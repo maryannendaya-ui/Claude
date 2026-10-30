@@ -177,6 +177,7 @@ table.ui input.name { width: 100%; min-width: 160px; }
     <div class="opts" id="maskOpts" hidden>
       <label title="Rows above the detected header row often hold titles like “Approved Vendor List dated …” — blanking them is the safe default."><input type="checkbox" id="optBlankTop" checked> Blank rows above the header row</label>
       <label>Key file passphrase <em>(optional)</em> <input type="password" id="passphrase" placeholder="leave empty for plain key file" style="min-width:220px"></label>
+      <label title="Masking stays consistent within one session. To mask MORE files later so they still match earlier masked files, load the earlier key here first.">Continue from a previous key <input type="file" id="seedKeyInput" accept=".json,.maskkey"> <span class="tpl" id="seedKeyName"></span></label>
     </div>
     <div class="row gap" style="margin-top:14px">
       <button id="btnMask" class="btn primary big" disabled>Mask the files</button>
@@ -382,8 +383,29 @@ const state = {
   key: null,      // loaded key for unmasking: { nameRev: Map token->orig, codeRev: Map digits->orig }
   keyRaw: null,
   maskResults: [],    // { name, blob, note, key? } ready to save
-  unmaskResults: []
+  unmaskResults: [],
+  maps: null          // the session's mapping — reused on every mask run so repeated runs stay consistent
 };
+function getMaps() {
+  return state.maps || (state.maps = { names: new Map(), codes: new Map(), counters: {}, usedNums: new Set() });
+}
+/** Seeds the session mapping from an earlier key file, so files masked now stay
+ *  consistent with files masked in a previous session. */
+function seedMaps(k) {
+  const maps = getMaps();
+  for (const [t, o] of k.names || []) {
+    const key = String(o).trim().replace(/\s+/g, ' ').toLowerCase();
+    if (!maps.names.has(key)) maps.names.set(key, { token: t, original: String(o).trim() });
+    const m = t.match(/^([A-Z][A-Z0-9]*)_(\d+)$/);
+    if (m) maps.counters[m[1]] = Math.max(maps.counters[m[1]] || 0, +m[2]);
+  }
+  for (const [mk, o] of k.codes || []) {
+    const key = String(o).replace(/^0+(?=\d)/, '');
+    if (!maps.codes.has(key)) maps.codes.set(key, { masked: mk, original: String(o) });
+    maps.usedNums.add(mk);
+    maps.usedNums.add(key);
+  }
+}
 
 /** Explicit save buttons — browsers often block automatic multi-file downloads,
  *  so the results of each step are always listed with their own Save button. */
@@ -543,12 +565,13 @@ function codeNumber(digits, maps) {
   const key = digits.replace(/^0+(?=\d)/, '');
   let m = maps.codes.get(key);
   if (!m) {
+    maps.usedNums.add(key);  // no future mask may equal this original
     const len = Math.max(digits.length, 4);
     let cand;
     do {
       cand = String(Math.floor(Math.random() * 9) + 1);
       while (cand.length < len) cand += String(Math.floor(Math.random() * 10));
-    } while (maps.usedNums.has(cand) || cand === key);
+    } while (maps.usedNums.has(cand));
     maps.usedNums.add(cand);
     m = { masked: cand, original: digits };
     maps.codes.set(key, m);
@@ -589,7 +612,7 @@ async function doMask() {
   busy(true, 'Masking…');
   await nextFrame();
   try {
-    const maps = { names: new Map(), codes: new Map(), counters: {}, usedNums: new Set() };
+    const maps = getMaps();   // persists for the session: masking twice gives identical results
     const colByNorm = new Map(state.columns.map((c) => [c.norm, c]));
     const blankTop = $('#optBlankTop').checked;
     let cells = 0;
@@ -723,8 +746,16 @@ function unmaskString(s, stats) {
   let out = String(s).replace(TOKEN_RE, (t) => {
     const o = state.key.nameRev.get(t);
     if (o !== undefined) { stats.names++; return o; }
+    stats.unknown++;
     return t;
   });
+  // codes written with thousand separators ("968,168" / "968 168") first…
+  out = out.replace(/\d{1,3}(?:[,\s]\d{3})+/g, (g) => {
+    const o = state.key.codeRev.get(g.replace(/[,\s]/g, '').replace(/^0+(?=\d)/, ''));
+    if (o !== undefined) { stats.codes++; return o; }
+    return g;
+  });
+  // …then plain digit runs
   out = out.replace(/\d{4,}/g, (d) => {
     const o = state.key.codeRev.get(d.replace(/^0+(?=\d)/, ''));
     if (o !== undefined) { stats.codes++; return o; }
@@ -752,7 +783,7 @@ async function unmaskFiles(fileList) {
   await nextFrame();
   const report = [];
   for (const f of files) {
-    const stats = { names: 0, codes: 0 };
+    const stats = { names: 0, codes: 0, unknown: 0 };
     try {
       let blob, outName;
       if (/\.(csv|txt|tsv)$/i.test(f.name)) {
@@ -763,8 +794,26 @@ async function unmaskFiles(fileList) {
       } else {
         // ExcelJS round-trip keeps the formatting of the processed report
         const wb = new ExcelJS.Workbook();
-        await wb.xlsx.load(await f.arrayBuffer());
-        wb.eachSheet((ws) => {
+        let legacy = false;
+        const buf = await f.arrayBuffer();
+        try {
+          await wb.xlsx.load(buf);
+        } catch (err) {
+          // old .xls (or anything ExcelJS cannot open): values-only fallback via SheetJS
+          legacy = true;
+          const xwb = XLSX.read(buf, { type: 'array', cellNF: true });
+          for (const sn of xwb.SheetNames) {
+            const ws = wb.addWorksheet(unmaskString(sn, stats).replace(/[[\]:*?/\\]/g, ' ').slice(0, 31) || 'Sheet');
+            sheetToGrid(xwb.Sheets[sn]).forEach((row, r) => row.forEach((v, c) => {
+              if (!isBlank(v)) ws.getRow(r + 1).getCell(c + 1).value = unmaskCellValue(v, stats);
+            }));
+          }
+        }
+        if (!legacy) wb.worksheets.forEach((ws) => {
+          const nn = unmaskString(ws.name, stats).replace(/[[\]:*?/\\]/g, ' ').slice(0, 31);
+          if (nn && nn !== ws.name) { try { ws.name = nn; } catch (err) { /* duplicate name — keep */ } }
+        });
+        if (!legacy) wb.eachSheet((ws) => {
           ws.eachRow({ includeEmpty: false }, (row) => {
             row.eachCell({ includeEmpty: false }, (cell) => {
               const v = cell.value;
@@ -790,11 +839,12 @@ async function unmaskFiles(fileList) {
             });
           });
         });
-        const buf = await wb.xlsx.writeBuffer();
+        const out = await wb.xlsx.writeBuffer();
         outName = f.name.replace(/\.[^.]+$/, '') + ' - UNMASKED.xlsx';
-        blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+        blob = new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
       }
-      state.unmaskResults.push({ name: outName, blob, note: `${(stats.names + stats.codes).toLocaleString('en-US')} values restored (${stats.names.toLocaleString('en-US')} names, ${stats.codes.toLocaleString('en-US')} codes)` });
+      state.unmaskResults.push({ name: outName, blob, note: `${(stats.names + stats.codes).toLocaleString('en-US')} values restored (${stats.names.toLocaleString('en-US')} names, ${stats.codes.toLocaleString('en-US')} codes)` + (stats.unknown ? ` — \u26a0 ${stats.unknown.toLocaleString('en-US')} token(s) NOT in this key: they were masked in a different run/session, load that run's key and unmask again` : '') });
+      if (stats.unknown) toast(`${f.name}: ${stats.unknown} masked token(s) are not in this key — they came from a different masking run. Unmask the result again with that run's key, or re-mask everything in one session.`, true);
     } catch (e) {
       console.error(e);
       report.push(`${esc(f.name)}: <span class="bad-text">failed — ${esc(e.message || e)}</span>`);
@@ -828,6 +878,25 @@ $('#maskCols').addEventListener('change', (e) => {
   renderMask();
 });
 $('#btnMask').addEventListener('click', doMask);
+$('#seedKeyInput').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  try {
+    let k = JSON.parse(await f.text());
+    if (k.app !== 'maskkit') throw new Error('not a Mask Kit key file');
+    if (k.encrypted) {
+      const pass = $('#passphrase').value;
+      if (!pass) throw new Error('key is encrypted — enter its passphrase in the field above first');
+      k = await decryptJSON(k, pass);
+    }
+    seedMaps(k);
+    $('#seedKeyName').textContent = `✓ continuing from ${f.name} (${(k.names || []).length + (k.codes || []).length} mappings kept)`;
+    toast('Previous key loaded — new masking stays consistent with files masked under that key.');
+  } catch (err) {
+    toast('Could not load previous key: ' + (err.message || err), true);
+  }
+});
 $('#keyInput').addEventListener('change', (e) => { if (e.target.files[0]) loadKey(e.target.files[0]); e.target.value = ''; });
 wireDrop('#dropKey', (f) => f[0] && loadKey(f[0]));
 $('#unmaskInput').addEventListener('change', (e) => { unmaskFiles(e.target.files); e.target.value = ''; });
@@ -836,7 +905,8 @@ $('#passphrase2').addEventListener('change', () => { if (state.keyRaw && state.k
 $('#btnReset').addEventListener('click', () => {
   if (state.files.length && !confirm('Clear all loaded files and column settings?')) return;
   state.files = []; state.columns = []; state.key = null; state.keyRaw = null;
-  state.maskResults = []; state.unmaskResults = [];
+  state.maskResults = []; state.unmaskResults = []; state.maps = null;
+  $('#seedKeyName').textContent = '';
   $('#keyName').textContent = ''; $('#unmaskList').innerHTML = ''; $('#maskResults').innerHTML = ''; $('#unmaskStats').textContent = '';
   renderMask();
 });

@@ -29,6 +29,7 @@
     <div class="opts" id="maskOpts" hidden>
       <label title="Rows above the detected header row often hold titles like “Approved Vendor List dated …” — blanking them is the safe default."><input type="checkbox" id="optBlankTop" checked> Blank rows above the header row</label>
       <label>Key file passphrase <em>(optional)</em> <input type="password" id="passphrase" placeholder="leave empty for plain key file" style="min-width:220px"></label>
+      <label title="Masking stays consistent within one session. To mask MORE files later so they still match earlier masked files, load the earlier key here first.">Continue from a previous key <input type="file" id="seedKeyInput" accept=".json,.maskkey"> <span class="tpl" id="seedKeyName"></span></label>
     </div>
     <div class="row gap" style="margin-top:14px">
       <button id="btnMask" class="btn primary big" disabled>Mask the files</button>
