@@ -142,6 +142,7 @@ table.ui input.name { width: 100%; min-width: 160px; }
 .spinner { width: 26px; height: 26px; border: 3px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+.xc { display: flex; align-items: center; gap: 4px; margin-top: 4px; font-size: 11.5px; color: var(--muted); white-space: nowrap; }
 .ok-text { color: var(--ok); font-weight: 600; }
 .bad-text { color: var(--bad); font-weight: 600; }
 .conn-stats { font-size: 12.5px; margin-top: 8px; }
@@ -386,6 +387,18 @@ function keyNorm(v) {
   return s || null;
 }
 /** Keys a master value can match on: the whole value, plus any embedded number of 4+ digits. */
+/** Pulls the code out of values like "INSPECTION, OVERHAUL (321110)" -> "321110".
+ *  Prefers a code in trailing parentheses; falls back to the last embedded number. */
+function extractCode(v) {
+  if (isBlank(v)) return null;
+  const s = String(isDate(v) ? fmtDate(v) : v);
+  const m = s.match(/\(\s*([A-Za-z0-9][A-Za-z0-9 \-\/.]{0,14})\s*\)\s*$/);
+  if (m && /\d/.test(m[1])) return m[1].replace(/\s+/g, '');
+  const collapsed = s.replace(/(\d)[,.\s](?=\d)/g, '$1');
+  const nums = collapsed.match(/\d{4,}/g);
+  return nums ? nums[nums.length - 1] : null;
+}
+
 function matchCandidates(v) {
   const out = [];
   const k = keyNorm(v);
@@ -1076,6 +1089,29 @@ function buildMaster() {
   const defs = cols.map((c) => ({ key: c.key, name: c.name, type: c.resolved }));
   defs.push({ key: '__file', name: 'Source File', type: 'text', source: true });
   defs.push({ key: '__sheet', name: 'Source Sheet', type: 'text', source: true });
+
+  // Codes embedded in text (e.g. "INSPECTION, OVERHAUL (321110)") get their own
+  // column — auto-enabled when at least half of a column's values end in a
+  // numeric code in parentheses; always switchable per column in step 2.
+  for (let j = cols.length - 1; j >= 0; j--) {
+    const c = cols[j];
+    if (c.resolved !== 'text') { c.xcode = false; continue; }
+    let on = (state.colPrefs[c.key] || {}).xcode;
+    if (on === undefined) {
+      let hits = 0, tot = 0;
+      for (let k = 0; k < rows.length && tot < 200; k++) {
+        const v = rows[k][j];
+        if (isBlank(v)) continue;
+        tot++;
+        if (/\(\s*\d{3,}\s*\)\s*$/.test(String(v))) hits++;
+      }
+      on = tot >= 5 && hits / tot >= 0.5;
+    }
+    c.xcode = !!on;
+    if (!on) continue;
+    defs.splice(j + 1, 0, { key: c.key + ':code', name: c.name.replace(/\s+code$/i, '') + ' Code', type: 'text', derived: true });
+    for (const r of rows) r.splice(j + 1, 0, extractCode(r[j]));
+  }
   const index = {};
   defs.forEach((d, i) => { index[d.key] = i; });
 
@@ -1701,7 +1737,7 @@ function renderColumns() {
     return `<tr class="${c.include ? '' : 'off'}" data-key="${esc(c.key)}">
       <td><input type="checkbox" data-act="inc" ${c.include ? 'checked' : ''} aria-label="Include column"></td>
       <td style="white-space:nowrap"><button class="icon-btn" data-act="up" ${i === 0 ? 'disabled' : ''} aria-label="Move up">▲</button><button class="icon-btn" data-act="down" ${i === cols.length - 1 ? 'disabled' : ''} aria-label="Move down">▼</button></td>
-      <td><input class="name" type="text" value="${esc(c.name)}" data-act="name" aria-label="Column name"></td>
+      <td><input class="name" type="text" value="${esc(c.name)}" data-act="name" aria-label="Column name">${resolved.get(c.key) === 'text' && c.include ? `<label class="xc" title="Pull the code out of values like “INSPECTION, OVERHAUL (321110)” into a separate “${esc(c.name)} Code” column"><input type="checkbox" data-act="xcode" ${c.xcode ? 'checked' : ''}> code → own column</label>` : ''}</td>
       <td><div class="chips">${chips || '<span class="muted">—</span>'}</div></td>
       <td><select data-act="type">${typeSel}</select></td>
       <td><select data-act="merge" aria-label="Combine into">${mergeSel}</select></td>
@@ -2240,6 +2276,7 @@ function init() {
     const act = t.dataset.act;
     if (act === 'inc') setPref(key, { include: t.checked });
     else if (act === 'name') setPref(key, { name: t.value.trim() || undefined });
+    else if (act === 'xcode') setPref(key, { xcode: t.checked });
     else if (act === 'type') setPref(key, { type: t.value });
     else if (act === 'merge' && t.value) {
       const from = state.columns.find((c) => c.key === key);
