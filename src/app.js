@@ -88,8 +88,9 @@ function matchCandidates(v) {
   if (!k) return out;
   out.push(k);
   if (typeof v === 'string') {
-    const nums = v.match(/\d{4,}/g);
-    if (nums) for (const d of nums) { const n = d.replace(/^0+(?=\d)/, ''); if (n !== k) out.push(n); }
+    const collapsed = v.replace(/(\d)[,.\s](?=\d)/g, '$1');
+    const nums = collapsed.match(/\d{4,}/g);
+    if (nums) for (const d of nums) { const n = d.replace(/^0+(?=\d)/, ''); if (n !== k && !out.includes(n)) out.push(n); }
   }
   return out;
 }
@@ -606,16 +607,40 @@ function connIndex(conn, keyColNorm) {
   }
   return idx;
 }
-function autoPickMasterKey(idx, defs, records, index) {
-  let best = '', bestHits = 0;
-  const sample = records.slice(0, 400);
+/** Scores every (master column, list column) pairing by sampled hit rate.
+ *  Returns pairs sorted best-first — the engine picks from these, and the
+ *  connection card shows them so a failed match is never a mystery. */
+function pairScan(src, defs, records, index) {
+  const step = Math.max(1, Math.floor(records.length / 300));
+  const sample = [];
+  for (let i = 0; i < records.length && sample.length < 300; i += step) sample.push(records[i]);
+  // candidate keys per master column, computed once
+  const candsByDef = new Map();
   for (const d of defs) {
-    if (d.source || d.conn || d.type !== 'text') continue;
-    let hits = 0;
-    for (const r of sample) if (matchCandidates(r[index[d.key]]).some((k) => idx.has(k))) hits++;
-    if (hits > bestHits) { bestHits = hits; best = d.key; }
+    if (d.source || d.conn) continue;
+    const mi = index[d.key];
+    let nonblank = 0;
+    const cands = sample.map((r) => {
+      if (isBlank(r[mi])) return null;
+      nonblank++;
+      return matchCandidates(r[mi]);
+    });
+    if (nonblank >= 3) candsByDef.set(d, cands);
   }
-  return bestHits >= Math.max(1, sample.length * 0.02) ? best : '';
+  const pairs = [];
+  for (const h of src.headers) {
+    const hi = src.headers.indexOf(h);
+    const keys = new Set();
+    for (const row of src.dataRows) { const k = keyNorm(row[hi]); if (k) keys.add(k); }
+    if (!keys.size) continue;
+    for (const [d, cands] of candsByDef) {
+      let hits = 0;
+      for (const c of cands) if (c && c.some((k) => keys.has(k))) hits++;
+      if (hits >= 3) pairs.push({ refNorm: h.norm, refName: h.name, masterKey: d.key, masterName: d.name, hits, pct: hits / sample.length });
+    }
+  }
+  pairs.sort((a, b) => b.hits - a.hits);
+  return pairs;
 }
 function joinVals(set) {
   if (!set || !set.size) return null;
@@ -628,12 +653,29 @@ function applyConnections(defs, index, records) {
   const fi = defs.findIndex((d) => d.key === '__file');
   let at = fi;
   for (const conn of state.connections) {
+    const src = state.sources.find((x) => x.id === conn.srcId);
+    const userPref = state.connPrefs[conn.key] || {};
+    const userPinned = userPref.masterKey && index[userPref.masterKey] !== undefined && !(defs[index[userPref.masterKey]] || {}).conn;
+    conn.diag = null;
+    if (!userPinned && src && records.length) {
+      // Full scan: every master column against every list column; take the best
+      // pairing, and a second one as the fallback rule when it uses different columns.
+      const pairs = pairScan(src, defs, records, index);
+      conn.diag = pairs.slice(0, 4);
+      if (pairs.length) {
+        conn.refKeyNorm = pairs[0].refNorm;
+        conn.masterKey = pairs[0].masterKey;
+        if (!userPref.refKeyNorm2) {
+          const second = pairs.find((p) => p.masterKey !== pairs[0].masterKey && p.refNorm !== pairs[0].refNorm);
+          if (second) { conn.refKeyNorm2 = second.refNorm; conn.masterKey2 = second.masterKey; }
+        }
+      } else {
+        conn.masterKey = '';
+      }
+    }
     const idx = connIndex(conn, conn.refKeyNorm);
     if (!idx) { conn.stats = { error: 'key column not found' }; continue; }
     const refRows = [...idx.values()].reduce((a, b) => a + b.count, 0);
-    if (!conn.masterKey || index[conn.masterKey] === undefined || (defs[index[conn.masterKey]] || {}).conn) {
-      conn.masterKey = autoPickMasterKey(idx, defs, records, index);
-    }
     const mi = index[conn.masterKey];
     const idx2 = conn.refKeyNorm2 ? connIndex(conn, conn.refKeyNorm2) : null;
     const mi2 = conn.masterKey2 ? index[conn.masterKey2] : undefined;
@@ -1380,11 +1422,23 @@ function renderConnections() {
     const st = conn.stats || {};
     let stats = '';
     if (st.error) stats = `<span class="bad-text">${esc(st.error)}</span>`;
-    else if (st.nomatch) stats = '<span class="warn-text">No master column matches this list — pick one above.</span>';
+    else if (st.nomatch) stats = '<span class="warn-text">Not connected yet — see the scan result below and pick the columns manually.</span>';
     else if (st.matched !== undefined) {
       const pc = M.records.length ? (st.matched / M.records.length * 100).toFixed(1) : '0';
       const via = st.via2 !== null ? ` (rule 1: ${st.via1.toLocaleString('en-US')}, rule 2: ${st.via2.toLocaleString('en-US')})` : '';
       stats = `<span class="${st.matched ? 'ok-text' : 'bad-text'}">${st.matched.toLocaleString('en-US')} of ${M.records.length.toLocaleString('en-US')} master rows matched (${pc}%)${via}</span> · ${st.refRows.toLocaleString('en-US')} list rows, ${st.keys.toLocaleString('en-US')} unique keys`;
+    }
+    let diag = '';
+    if (conn.diag && conn.diag.length) {
+      diag = 'Pairings found by the automatic scan: ' + conn.diag.map((p) => `${esc(p.masterName)} ↔ ${esc(p.refName)} (${(p.pct * 100).toFixed(0)}%)`).join(' · ');
+    } else if (conn.diag && !conn.diag.length) {
+      const mi2 = M.index[conn.masterKey];
+      const mSample = mi2 !== undefined ? M.records.map((r) => r[mi2]).filter((v) => !isBlank(v)).slice(0, 2).map((v) => `"${esc(displayValue(v))}"`).join(', ') : '';
+      const hi2 = src ? src.headers.findIndex((h) => h.norm === conn.refKeyNorm) : -1;
+      const rSample = hi2 >= 0 ? src.dataRows.map((r) => r[hi2]).filter((v) => !isBlank(v)).slice(0, 3).map((v) => `"${esc(displayValue(v))}"`).join(', ') : '';
+      diag = `<span class="bad-text">The scan compared every master column with every list column and found no values in common.</span> ` +
+        `List keys look like ${rSample}${mSample ? `; e.g. master “${esc((M.defs[mi2] || {}).name || '')}” holds ${mSample}` : ''}. ` +
+        `Pick the columns manually above — or the connecting value may genuinely not exist in the raw files (e.g. the list keys on a group/vendor number that no raw column contains).`;
     }
     return `<div class="bd" data-conn="${esc(conn.key)}">
       <div class="bd-head"><h3>${esc(src ? src.fileName + ' › ' + src.sheetName : conn.key)}</h3></div>
@@ -1401,6 +1455,7 @@ function renderConnections() {
         <label class="field" style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" data-cn="exportSheet" ${conn.exportSheet ? 'checked' : ''}> <span>Include full list as its own sheet in the export</span></label>
       </div>
       <div class="conn-stats">${stats}</div>
+      ${diag ? `<div class="conn-stats muted">${diag}</div>` : ''}
     </div>`;
   }).join('');
 }
