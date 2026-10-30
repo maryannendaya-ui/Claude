@@ -68,7 +68,7 @@ main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 60px; display: grid
 .icon-btn:hover { border-color: var(--line-strong); color: var(--ink); }
 .icon-btn:disabled { opacity: .3; cursor: default; }
 
-.drops { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
+.drops { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 12px; }
 .drop { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; text-align: center; min-height: 120px; padding: 18px; border: 2px dashed var(--line-strong); border-radius: 10px; cursor: pointer; background: var(--row-alt); }
 .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-soft); }
 .drop input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
@@ -142,6 +142,10 @@ table.ui input.name { width: 100%; min-width: 160px; }
 .spinner { width: 26px; height: 26px; border: 3px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+.ok-text { color: var(--ok); font-weight: 600; }
+.bad-text { color: var(--bad); font-weight: 600; }
+.conn-stats { font-size: 12.5px; margin-top: 8px; }
+
 @media (max-width: 720px) {
   .topbar { padding: 12px 16px; }
   .drops, .grid2 { grid-template-columns: 1fr; }
@@ -174,6 +178,10 @@ table.ui input.name { width: 100%; min-width: 160px; }
         <input type="file" id="fileInput" multiple accept=".xlsx,.xlsm,.xls,.xlsb,.ods,.csv,.txt">
         <strong>Drop data files here</strong><span>or click to browse</span>
       </label>
+      <label class="drop alt" id="dropRef">
+        <input type="file" id="refInput" multiple accept=".xlsx,.xlsm,.xls,.xlsb,.ods,.csv,.txt">
+        <strong>Connected lists <em>(optional)</em></strong><span>Reference data such as an approved vendor list — matched against the master, kept separate from it</span>
+      </label>
       <label class="drop alt" id="dropTemplate">
         <input type="file" id="templateInput" accept=".xlsx,.xlsm,.xls,.xlsb,.ods,.csv,.txt">
         <strong>Master layout <em>(optional)</em></strong><span>A file with only the column headers you want, in the order you want</span>
@@ -187,6 +195,11 @@ table.ui input.name { width: 100%; min-width: 160px; }
     <div class="card-head"><span class="step">2</span><div><h2>Master sheet columns</h2><p>Columns with the same name across sheets are combined automatically. Rename, reorder, combine, or exclude them here.</p></div></div>
     <div class="opts" id="masterOpts"></div>
     <div id="columns"></div>
+  </section>
+
+  <section class="card" id="stepConn" hidden>
+    <div class="card-head"><span class="step">2b</span><div><h2>Connected lists</h2><p>Each list stays separate. Master rows are matched against it — by exact value or by a number embedded in the text, e.g. “PRODUCT RELATED SERV (344140)” matches group 344140 — and get a match-count column.</p></div></div>
+    <div id="connections"></div>
   </section>
 
   <section class="card" id="step3" hidden>
@@ -207,6 +220,7 @@ table.ui input.name { width: 100%; min-width: 160px; }
     <div class="tabs" role="tablist">
       <button class="tab active" data-tab="summary">Summary</button>
       <button class="tab" data-tab="master">Master sheet</button>
+      <button class="tab" data-tab="verify">Verification</button>
     </div>
     <div id="preview"></div>
     <div class="export-bar">
@@ -345,7 +359,10 @@ const state = {
   summary: null,
   tab: 'summary',
   peek: null,
-  sheetPrefs: {}        // sheetKey -> { include, headerRow } — reapplied when the same file/sheet is loaded again
+  sheetPrefs: {},       // sheetKey -> { include, headerRow, role } — reapplied when the same file/sheet is loaded again
+  connections: [],      // one per included reference sheet
+  connPrefs: {},        // sheetKey -> { name, refKeyNorm, masterKey, addCount, exportSheet }
+  verification: null
 };
 let nextId = 1;
 
@@ -359,6 +376,26 @@ const digits = (s) => s.replace(/\D+/g, '');
 const isDate = (v) => v instanceof Date && !isNaN(v);
 const isBlank = (v) => v === null || v === undefined || v === '';
 const sheetKey = (s) => s.fileName + '|' + s.sheetName;
+/** Normalises a key for matching: trims, ignores case and leading zeros ("000123" matches 123). */
+function keyNorm(v) {
+  if (isBlank(v)) return null;
+  if (isDate(v)) return 'd' + v.getTime();
+  let s = String(v).trim().toLowerCase().replace(/\s+/g, ' ').replace(/\.0+$/, '');
+  if (/^\d+$/.test(s)) s = s.replace(/^0+(?=\d)/, '');
+  return s || null;
+}
+/** Keys a master value can match on: the whole value, plus any embedded number of 4+ digits. */
+function matchCandidates(v) {
+  const out = [];
+  const k = keyNorm(v);
+  if (!k) return out;
+  out.push(k);
+  if (typeof v === 'string') {
+    const nums = v.match(/\d{4,}/g);
+    if (nums) for (const d of nums) { const n = d.replace(/^0+(?=\d)/, ''); if (n !== k) out.push(n); }
+  }
+  return out;
+}
 const fmtInt = (n) => Math.round(n).toLocaleString('en-US');
 
 function colLetter(c) {
@@ -556,7 +593,7 @@ function detectHeaderRow(grid) {
   return best;
 }
 
-async function addFiles(fileList) {
+async function addFiles(fileList, role) {
   const files = [...fileList];
   if (!files.length) return;
   busy(true, 'Reading files…');
@@ -576,12 +613,13 @@ async function addFiles(fileList) {
         const src = {
           id: nextId++, fileName: f.name, sheetName: /\.(csv|txt|tsv)$/i.test(f.name) ? '(CSV)' : name,
           grid: g.grid, filled: g.filled, r0: g.r0, c0: g.c0,
-          headerIdx: 0, include: g.grid.length > 0 && !hidden, hidden
+          headerIdx: 0, include: g.grid.length > 0 && !hidden, hidden, role: role || 'data'
         };
         src.headerIdx = detectHeaderRow(state.opts.fillMerged ? src.filled : src.grid);
         const pref = state.sheetPrefs[sheetKey(src)];
         if (pref) {
           if (pref.include !== undefined) src.include = pref.include;
+          if (pref.role) src.role = pref.role;
           if (pref.headerRow) src.headerIdx = Math.max(0, Math.min(src.grid.length - 1, pref.headerRow - src.r0 - 1));
         }
         state.sources.push(src);
@@ -661,7 +699,8 @@ async function loadTemplate(file) {
 // Analysis: headers, data rows, columns
 // ---------------------------------------------------------------------------
 const gridOf = (s) => (state.opts.fillMerged ? s.filled : s.grid);
-const included = () => state.sources.filter((s) => s.include);
+const included = () => state.sources.filter((s) => s.include && s.role !== 'ref');
+const refSources = () => state.sources.filter((s) => s.include && s.role === 'ref');
 
 function analyseSource(src) {
   const g = gridOf(src);
@@ -807,12 +846,92 @@ function coerce(v, type) {
   return { v: n, ok: true };
 }
 
+function defaultConnName(src) {
+  const stem = src.fileName.replace(/\.[^.]+$/, '');
+  const m = stem.match(/[A-Za-z]{2,}[A-Za-z&]*/);  // first real word, skipping upload prefixes
+  return (m ? m[0].toUpperCase() : stem.slice(0, 20)) || 'List';
+}
+function syncConnections() {
+  const prev = new Map(state.connections.map((c) => [c.key, c]));
+  state.connections = refSources().map((src) => {
+    const key = sheetKey(src);
+    const old = prev.get(key) || state.connPrefs[key] || {};
+    const c = {
+      key, srcId: src.id,
+      name: old.name || defaultConnName(src),
+      refKeyNorm: src.headers.some((h) => h.norm === old.refKeyNorm) ? old.refKeyNorm
+        : (src.headers.find((h) => /(number|no\.?$|\bid\b|code)/i.test(h.name)) || src.headers[0] || {}).norm,
+      masterKey: old.masterKey || '',
+      addCount: old.addCount !== false,
+      exportSheet: !!old.exportSheet,
+      stats: null
+    };
+    return c;
+  });
+}
+/** Builds keyNorm -> ref row count for a connection. */
+function connIndex(conn) {
+  const src = state.sources.find((x) => x.id === conn.srcId);
+  const hi = src ? src.headers.findIndex((h) => h.norm === conn.refKeyNorm) : -1;
+  if (!src || hi < 0) return null;
+  const idx = new Map();
+  for (const row of src.dataRows) {
+    const k = keyNorm(row[hi]);
+    if (k) idx.set(k, (idx.get(k) || 0) + 1);
+  }
+  return idx;
+}
+function autoPickMasterKey(conn, idx, defs, records, index) {
+  let best = '', bestHits = 0;
+  const sample = records.slice(0, 400);
+  for (const d of defs) {
+    if (d.source || d.conn || d.type !== 'text') continue;
+    let hits = 0;
+    for (const r of sample) if (matchCandidates(r[index[d.key]]).some((k) => idx.has(k))) hits++;
+    if (hits > bestHits) { bestHits = hits; best = d.key; }
+  }
+  return bestHits >= Math.max(1, sample.length * 0.1) ? best : '';
+}
+/** Appends one match-count column per active connection; records gain values before __file. */
+function applyConnections(defs, index, records) {
+  syncConnections();
+  const fi = defs.findIndex((d) => d.key === '__file');
+  let at = fi;
+  for (const conn of state.connections) {
+    const idx = connIndex(conn);
+    if (!idx) { conn.stats = { error: 'key column not found' }; continue; }
+    if (!conn.masterKey || index[conn.masterKey] === undefined || (defs[index[conn.masterKey]] || {}).conn) {
+      conn.masterKey = autoPickMasterKey(conn, idx, defs, records, index);
+    }
+    const mi = index[conn.masterKey];
+    if (mi === undefined) { conn.stats = { refRows: [...idx.values()].reduce((a, b) => a + b, 0), keys: idx.size, nomatch: true }; continue; }
+    let matched = 0;
+    const vals = records.map((r) => {
+      let n = 0;
+      for (const k of matchCandidates(r[mi])) { const c = idx.get(k); if (c) { n = c; break; } }
+      if (n) matched++;
+      return n;
+    });
+    conn.stats = { refRows: [...idx.values()].reduce((a, b) => a + b, 0), keys: idx.size, matched, unmatched: records.length - matched };
+    if (!conn.addCount) continue;
+    const def = { key: 'conn:' + conn.key, name: conn.name + ' Matches', type: 'int', conn: true };
+    defs.splice(at, 0, def);
+    records.forEach((r, i) => r.splice(at, 0, vals[i]));
+    at++;
+  }
+  Object.keys(index).forEach((k) => delete index[k]);
+  defs.forEach((d, i) => { index[d.key] = i; });
+}
+
 function buildMaster() {
   const cols = state.columns.filter((c) => c.include);
   const keyIdx = new Map(cols.map((c, i) => [c.key, i]));
   const records = [];
   let onlyExcluded = 0;
+  const srcCounts = new Map();   // sheetKey -> { onlyExcluded, dupes }
   for (const s of included()) {
+    const sc = { onlyExcluded: 0, dupes: 0 };
+    srcCounts.set(sheetKey(s), sc);
     const map = s.headers.map((h) => keyIdx.get(state.normMap.get(h.norm)));
     for (const cells of s.dataRows) {
       const vals = new Array(cols.length + 2).fill(null);
@@ -823,7 +942,7 @@ function buildMaster() {
         if (vals[k] === null) vals[k] = cells[i];
         any = true;
       }
-      if (!any) { onlyExcluded++; continue; }
+      if (!any) { onlyExcluded++; sc.onlyExcluded++; continue; }
       vals[cols.length] = s.fileName;
       vals[cols.length + 1] = s.sheetName;
       records.push(vals);
@@ -841,13 +960,26 @@ function buildMaster() {
     if (bad) issues.push({ col: c.name, count: bad, examples });
   });
 
+  // Snapshot of every column's total before de-duplication — the verification layer
+  // reconciles these against the final master.
+  const rawSums = cols.map((c, i) => {
+    if (c.resolved !== 'int' && c.resolved !== 'dec') return null;
+    let t = 0; for (const r of records) if (typeof r[i] === 'number') t += r[i];
+    return t;
+  });
+  const removedSums = cols.map(() => 0);
   let dupes = 0;
   let rows = records;
   if (state.opts.dedupe) {
     const seen = new Set();
     rows = records.filter((r) => {
       const k = JSON.stringify(r.slice(0, cols.length).map((v) => (isDate(v) ? 'd' + v.getTime() : typeof v === 'string' ? v.toLowerCase() : v)));
-      if (seen.has(k)) { dupes++; return false; }
+      if (seen.has(k)) {
+        dupes++;
+        srcCounts.get(sheetKey({ fileName: r[cols.length], sheetName: r[cols.length + 1] })).dupes++;
+        cols.forEach((c, i) => { if (rawSums[i] !== null && typeof r[i] === 'number') removedSums[i] += r[i]; });
+        return false;
+      }
       seen.add(k); return true;
     });
   }
@@ -870,9 +1002,13 @@ function buildMaster() {
     }).map((p) => p[0]);
   }
 
+  applyConnections(defs, index, rows);
+
   const stats = { blank: 0, totals: 0, repeats: 0, onlyExcluded, dupes };
   for (const s of included()) { stats.blank += s.stats.blank; stats.totals += s.stats.totals; stats.repeats += s.stats.repeats; }
-  state.master = { defs, index, records: rows, issues, stats };
+  const sums = {};
+  cols.forEach((c, i) => { if (rawSums[i] !== null) sums[c.key] = { name: c.name, type: c.resolved, raw: rawSums[i], removed: removedSums[i] }; });
+  state.master = { defs, index, records: rows, issues, stats, srcCounts, rawSums: sums };
 }
 
 /** Columns as they appear in the exported master sheet. */
@@ -1025,7 +1161,7 @@ function suggestBreakdowns() {
   if (!M || !M.records.length) return [];
   const n = M.records.length;
   const dataDefs = M.defs.filter((d) => !d.source);
-  const nums = dataDefs.filter((d) => (d.type === 'int' || d.type === 'dec') && !ID_RE.test(d.name)).slice(0, 3);
+  const nums = dataDefs.filter((d) => (d.type === 'int' || d.type === 'dec') && !d.conn && !ID_RE.test(d.name)).slice(0, 3);
   const measures = [{ agg: 'count' }, ...nums.map((d) => ({ agg: 'sum', col: d.key }))];
   const cands = [];
   for (const d of dataDefs) {
@@ -1080,7 +1216,7 @@ function computeSummary() {
   });
 
   // Key figures for numeric columns
-  const numDefs = M.defs.filter((d) => !d.source && NUMERIC.has(d.type));
+  const numDefs = M.defs.filter((d) => !d.source && !d.conn && NUMERIC.has(d.type));
   if (numDefs.length) {
     blocks.push({
       title: 'Key Figures',
@@ -1096,6 +1232,18 @@ function computeSummary() {
           { v: aggregate(M.records, { agg: 'max', col: d.key }, M), t },
           aggregate(M.records, { agg: 'counta', col: d.key }, M)];
       })
+    });
+  }
+
+  const conns = state.connections.filter((c) => c.stats && !c.stats.error);
+  if (conns.length) {
+    blocks.push({
+      title: 'Connected Lists — Match Coverage',
+      headers: ['Connected List', 'List Rows', 'Unique Keys', 'Master Rows Matched', 'Master Rows Not Matched', 'Coverage'],
+      types: ['text', 'int', 'int', 'int', 'int', 'pct'],
+      rows: conns.map((c) => c.stats.nomatch
+        ? [c.name + ' (no matching master column found)', c.stats.refRows, c.stats.keys, 0, M.records.length, 0]
+        : [c.name, c.stats.refRows, c.stats.keys, c.stats.matched, c.stats.unmatched, M.records.length ? c.stats.matched / M.records.length : 0])
     });
   }
 
@@ -1118,6 +1266,127 @@ function computeSummary() {
 }
 
 // ---------------------------------------------------------------------------
+// Verification: independent reconciliation of the output against the raw input
+// ---------------------------------------------------------------------------
+const OK = '\u2713 Tally';
+const tallyNum = (d, type) => (d === 0 ? OK : '\u2717 Off by ' + displayValue(d, type || 'int'));
+const tallyFloat = (d, scale) => (Math.abs(d) <= Math.max(1e-6, Math.abs(scale) * 1e-9) ? OK : '\u2717 Off by ' + displayValue(d, 'dec'));
+
+function computeVerification() {
+  const M = state.master;
+  if (!M) { state.verification = null; return; }
+  const blocks = [];
+
+  // 1. Row reconciliation — master-side counts are recounted from the final records,
+  //    raw-side counts straight from each sheet's grid.
+  const fi = M.index.__file, shi = M.index.__sheet;
+  const perSrc = new Map();
+  for (const r of M.records) { const k = r[fi] + '|' + r[shi]; perSrc.set(k, (perSrc.get(k) || 0) + 1); }
+  const rowRows = included().map((src) => {
+    const g = gridOf(src);
+    const raw = Math.max(0, g.length - src.headerIdx - 1);
+    const sc = M.srcCounts.get(sheetKey(src)) || { onlyExcluded: 0, dupes: 0 };
+    const skipped = src.stats.blank + src.stats.repeats + src.stats.totals + sc.onlyExcluded + sc.dupes;
+    const inMaster = perSrc.get(src.fileName + '|' + src.sheetName) || 0;
+    return [src.fileName, src.sheetName, raw, src.stats.blank, src.stats.repeats, src.stats.totals, sc.onlyExcluded + sc.dupes, inMaster, tallyNum(raw - skipped - inMaster)];
+  });
+  const tot = (i) => rowRows.reduce((a, r) => a + r[i], 0);
+  blocks.push({
+    title: 'Row Count Reconciliation — every raw row accounted for',
+    headers: ['Source File', 'Sheet', 'Raw Rows', 'Blank', 'Repeated Headers', 'Total Rows Skipped', 'Duplicates / Unmapped', 'In Master', 'Check'],
+    types: ['text', 'text', 'int', 'int', 'int', 'int', 'int', 'int', 'status'],
+    rows: rowRows,
+    total: ['Total', '', tot(2), tot(3), tot(4), tot(5), tot(6), tot(7), tallyNum(tot(2) - tot(3) - tot(4) - tot(5) - tot(6) - tot(7))]
+  });
+  const masterRecount = [...perSrc.values()].reduce((a, b) => a + b, 0);
+  blocks.push({
+    title: 'Master Sheet Check',
+    headers: ['Check', 'Expected', 'Actual', 'Status'], types: ['text', 'int', 'int', 'status'],
+    rows: [['Master records = sum of rows kept per source', tot(7), M.records.length, tallyNum(tot(7) - M.records.length)],
+           ['Every master row carries its source', M.records.length, masterRecount, tallyNum(M.records.length - masterRecount)]]
+  });
+
+  // 2. Value reconciliation — totals of every numeric column, raw vs master.
+  const valRows = [];
+  for (const [key, info] of Object.entries(M.rawSums)) {
+    const ci = M.index[key];
+    if (ci === undefined) continue;
+    let fin = 0;
+    for (const r of M.records) if (typeof r[ci] === 'number') fin += r[ci];
+    const d = info.raw - info.removed - fin;
+    valRows.push([info.name, { v: info.raw, t: info.type }, { v: info.removed, t: info.type }, { v: fin, t: info.type }, tallyFloat(d, info.raw)]);
+  }
+  if (valRows.length) {
+    blocks.push({
+      title: 'Value Reconciliation — column totals, raw data vs master sheet',
+      headers: ['Column', 'Raw Data Total', 'Removed Duplicates', 'Master Sheet Total', 'Status'],
+      types: ['text', 'auto', 'auto', 'auto', 'status'],
+      rows: valRows
+    });
+  }
+
+  // 3. Summary cross-check — every breakdown total re-added from its own rows
+  //    and compared with a direct recount of the master.
+  const bdRows = [];
+  for (const bd of state.breakdowns) {
+    const b = breakdownBlock(bd, M);
+    if (!b || !b.total) continue;
+    b.headers.forEach((h, i) => {
+      if (i === 0 || !['int', 'dec'].includes(b.types[i])) return;
+      const colSum = b.rows.reduce((a, r) => a + (typeof r[i] === 'number' ? r[i] : 0), 0);
+      const totalCell = typeof b.total[i] === 'number' ? b.total[i] : 0;
+      bdRows.push([b.title, h, { v: colSum, t: b.types[i] }, { v: totalCell, t: b.types[i] }, tallyFloat(colSum - totalCell, colSum)]);
+    });
+  }
+  if (bdRows.length) {
+    blocks.push({
+      title: 'Summary Cross-check — breakdown rows add up to their totals',
+      headers: ['Summary Table', 'Column', 'Sum of Rows', 'Total Row', 'Status'],
+      types: ['text', 'text', 'auto', 'auto', 'status'],
+      rows: bdRows
+    });
+  }
+
+  // 4. Extra sheets partition the master.
+  const si = M.index[state.opts.splitBy];
+  if (si !== undefined) {
+    const groups = groupRows(M.records, si, M.defs[si].type === 'date' ? 'month' : 'value');
+    const n = groups.reduce((a, g) => a + g.rows.length, 0);
+    blocks.push({
+      title: 'Extra Sheets Check',
+      headers: ['Check', 'Expected', 'Actual', 'Status'], types: ['text', 'int', 'int', 'status'],
+      rows: [[`Rows across the ${Math.min(groups.length, 100)} "${M.defs[si].name}" sheets = master records${groups.length > 100 ? ' (over 100 values — not all exported!)' : ''}`,
+        M.records.length, n, groups.length > 100 ? '\u2717 Review' : tallyNum(M.records.length - n)]]
+    });
+  }
+
+  // 5. Connected lists — coverage recounted from the match columns.
+  const connRows = [];
+  for (const conn of state.connections) {
+    if (!conn.stats || conn.stats.error || conn.stats.nomatch) continue;
+    const ci = M.index['conn:' + conn.key];
+    if (ci === undefined) {
+      connRows.push([conn.name, 'matched rows (column not added)', conn.stats.matched, conn.stats.matched, OK]);
+      continue;
+    }
+    let m = 0;
+    for (const r of M.records) if (typeof r[ci] === 'number' && r[ci] > 0) m++;
+    connRows.push([conn.name, 'master rows with a match', conn.stats.matched, m, tallyNum(conn.stats.matched - m)]);
+  }
+  if (connRows.length) {
+    blocks.push({
+      title: 'Connected Lists Check',
+      headers: ['Connected List', 'Check', 'Reported', 'Recounted', 'Status'],
+      types: ['text', 'text', 'int', 'int', 'status'],
+      rows: connRows
+    });
+  }
+
+  const bad = blocks.reduce((a, b) => a + b.rows.concat(b.total ? [b.total] : []).filter((r) => String(r[r.length - 1]).startsWith('\u2717')).length, 0);
+  state.verification = { blocks, bad };
+}
+
+// ---------------------------------------------------------------------------
 // Refresh pipeline
 // ---------------------------------------------------------------------------
 function refresh(level) {
@@ -1128,7 +1397,7 @@ function refresh(level) {
       if (included().length) buildMaster(); else state.master = null;
       if (state.bdAuto) state.breakdowns = suggestBreakdowns();
     }
-    if (state.master && level !== 'preview') computeSummary();
+    if (state.master && level !== 'preview') { computeSummary(); computeVerification(); }
   } catch (e) {
     console.error(e);
     toast('Something went wrong: ' + (e.message || e), true);
@@ -1149,6 +1418,7 @@ function render(level) {
   if (level === 'sources' || level === 'columns' || level === 'all') { renderSources(); renderMasterOpts(); renderColumns(); }
   if (level !== 'preview' && level !== 'summary') renderBreakdowns();
   if (level === 'summary') renderBreakdowns();
+  renderConnections();
   renderPreview();
   $('#title').value = state.title;
   $('#fileName').value = state.fileName;
@@ -1164,15 +1434,16 @@ function renderSources() {
       <td><input type="checkbox" data-act="inc" ${s.include ? 'checked' : ''} aria-label="Include sheet"></td>
       <td>${esc(s.fileName)}</td>
       <td>${esc(s.sheetName)}${s.hidden ? ' <span class="badge">hidden</span>' : ''}</td>
+      <td><select data-act="role" aria-label="Use as"><option value="data" ${s.role !== 'ref' ? 'selected' : ''}>Data</option><option value="ref" ${s.role === 'ref' ? 'selected' : ''}>Connected list</option></select></td>
       <td><input type="number" min="${s.r0 + 1}" max="${s.r0 + Math.max(s.grid.length, 1)}" value="${hdrRow}" data-act="hdr" aria-label="Header row"></td>
       <td class="num">${s.headers.length}</td>
       <td class="num">${s.dataRows.length.toLocaleString('en-US')}</td>
       <td>${dropped ? `<span class="badge warn" title="Total/subtotal rows: ${s.stats.totals}; repeated header rows: ${s.stats.repeats}">${dropped} skipped</span> ` : ''}${s.dupOf ? `<span class="badge" title="Same columns and identical rows as ${esc(s.dupOf)}">same data as ${esc(s.dupOf)}</span>` : ''}${!s.grid.length ? '<span class="badge">empty</span>' : ''}</td>
       <td><button class="btn sm" data-act="peek">${state.peek === s.id ? 'Hide' : 'Preview'}</button>
           <button class="icon-btn" data-act="del" title="Remove sheet" aria-label="Remove sheet">✕</button></td>
-    </tr>${state.peek === s.id ? `<tr data-id="${s.id}"><td colspan="8">${peekHtml(s)}</td></tr>` : ''}`;
+    </tr>${state.peek === s.id ? `<tr data-id="${s.id}"><td colspan="9">${peekHtml(s)}</td></tr>` : ''}`;
   }).join('');
-  el.innerHTML = `<div class="tbl-wrap"><table class="ui"><thead><tr><th></th><th>File</th><th>Sheet</th><th>Header row</th><th class="num">Columns</th><th class="num">Data rows</th><th>Notes</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  el.innerHTML = `<div class="tbl-wrap"><table class="ui"><thead><tr><th></th><th>File</th><th>Sheet</th><th>Use as</th><th>Header row</th><th class="num">Columns</th><th class="num">Data rows</th><th>Notes</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function peekHtml(s) {
@@ -1241,6 +1512,35 @@ function renderColumns() {
     <div class="tbl-wrap"><table class="ui"><thead><tr><th></th><th>Order</th><th>Master column name</th><th>Source headers</th><th>Type</th><th>Combine into</th><th>Notes</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
+function renderConnections() {
+  const el = $('#connections');
+  const M = state.master;
+  $('#stepConn').hidden = !state.connections.length || !M;
+  if (!state.connections.length || !M) { el.innerHTML = ''; return; }
+  el.innerHTML = state.connections.map((conn) => {
+    const src = state.sources.find((x) => x.id === conn.srcId);
+    const st = conn.stats || {};
+    let stats = '';
+    if (st.error) stats = `<span class="bad-text">${esc(st.error)}</span>`;
+    else if (st.nomatch) stats = '<span class="warn-text">No master column matches this list — pick one above.</span>';
+    else if (st.matched !== undefined) {
+      const pc = M.records.length ? (st.matched / M.records.length * 100).toFixed(1) : '0';
+      stats = `<span class="${st.matched ? 'ok-text' : 'bad-text'}">${st.matched.toLocaleString('en-US')} of ${M.records.length.toLocaleString('en-US')} master rows matched (${pc}%)</span> · ${st.refRows.toLocaleString('en-US')} list rows, ${st.keys.toLocaleString('en-US')} unique keys`;
+    }
+    return `<div class="bd" data-conn="${esc(conn.key)}">
+      <div class="bd-head"><h3>${esc(src ? src.fileName + ' › ' + src.sheetName : conn.key)}</h3></div>
+      <div class="bd-grid">
+        <label class="field"><span>Name (used for the Matches column)</span><input type="text" data-cn="name" value="${esc(conn.name)}"></label>
+        <label class="field"><span>Key column in the list</span><select data-cn="refKeyNorm">${(src ? src.headers : []).map((h) => `<option value="${esc(h.norm)}" ${h.norm === conn.refKeyNorm ? 'selected' : ''}>${esc(h.name)}</option>`).join('')}</select></label>
+        <label class="field"><span>Match against master column</span><select data-cn="masterKey"><option value="">(auto)</option>${M.defs.filter((d) => !d.source && !d.conn).map((d) => `<option value="${esc(d.key)}" ${d.key === conn.masterKey ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}</select></label>
+        <label class="field" style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" data-cn="addCount" ${conn.addCount ? 'checked' : ''}> <span>Add “${esc(conn.name)} Matches” column to master</span></label>
+        <label class="field" style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" data-cn="exportSheet" ${conn.exportSheet ? 'checked' : ''}> <span>Include full list as its own sheet in the export</span></label>
+      </div>
+      <div class="conn-stats">${stats}</div>
+    </div>`;
+  }).join('');
+}
+
 function renderBreakdowns() {
   const el = $('#breakdowns');
   const M = state.master;
@@ -1280,6 +1580,10 @@ function blockHtml(b) {
   const cell = (v, t) => {
     let val = v, type = t;
     if (v && typeof v === 'object' && !isDate(v)) { val = v.v; type = v.t; }
+    if (type === 'status') {
+      const ok = String(val).startsWith('\u2713');
+      return `<td class="${ok ? 'ok-text' : 'bad-text'}">${esc(val)}</td>`;
+    }
     type = autoType(val, type);
     const cls = left ? (NUMERIC.has(type) ? 'n' : 't') : '';
     return `<td class="${cls}">${esc(displayValue(val, type))}</td>`;
@@ -1296,9 +1600,20 @@ function renderPreview() {
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === state.tab));
   if (!M) { el.innerHTML = ''; return; }
   const n = M.records.length;
-  $('#exportInfo').textContent = `${n.toLocaleString('en-US')} records · ${M.defs.filter((d) => !d.source).length} columns · ${included().length} sheet(s)`;
+  const V = state.verification;
+  $('#exportInfo').innerHTML = `${n.toLocaleString('en-US')} records · ${M.defs.filter((d) => !d.source && !d.conn).length} columns · ${included().length} sheet(s)` +
+    (V ? (V.bad ? ` · <span class="bad-text">\u2717 ${V.bad} verification check(s) failed</span>` : ' · <span class="ok-text">\u2713 verified against raw data</span>') : '');
   if (state.tab === 'summary') {
     el.innerHTML = (state.summary || []).map(blockHtml).join('');
+    return;
+  }
+  if (state.tab === 'verify') {
+    const V = state.verification;
+    if (!V) { el.innerHTML = ''; return; }
+    const head = V.bad
+      ? `<div class="bad-text" style="margin-bottom:12px">\u2717 ${V.bad} check(s) did not tally — review below before using the report.</div>`
+      : `<div class="ok-text" style="margin-bottom:12px">\u2713 All checks tally: every raw row is accounted for and all totals match the raw data.</div>`;
+    el.innerHTML = head + V.blocks.map(blockHtml).join('');
     return;
   }
   const lim = 200;
@@ -1381,8 +1696,15 @@ function writeTable(ws, r0, c0, headers, types, rows, total, widths, opts = {}) 
     for (let i = 0; i < headers.length; i++) {
       let v = row[i], t = types[i];
       if (v && typeof v === 'object' && !isDate(v)) { t = v.t; v = v.v; }
-      t = autoType(v, t);
       const cell = xr.getCell(c0 + i);
+      if (t === 'status') {
+        const ok = String(v).startsWith('\u2713');
+        cell.value = v;
+        cell.style = { ...xStyle('body', 'text', ri % 2 === 1), font: { name: 'Calibri', size: 11, bold: true, color: { argb: ok ? 'FF18794E' : 'FFB42318' } } };
+        if (ri < sample) widths[c0 + i] = Math.max(widths[c0 + i] || 0, String(v).length);
+        continue;
+      }
+      t = autoType(v, t);
       cell.value = isBlank(v) ? null : v;
       cell.style = xStyle('body', t, ri % 2 === 1);
       if (ri < sample) widths[c0 + i] = Math.max(widths[c0 + i] || 0, textLen(v, t));
@@ -1395,6 +1717,13 @@ function writeTable(ws, r0, c0, headers, types, rows, total, widths, opts = {}) 
     for (let i = 0; i < headers.length; i++) {
       let v = total[i], t = i === 0 ? 'text' : types[i];
       const cell = xr.getCell(c0 + i);
+      if (t === 'status') {
+        const ok = String(v).startsWith('\u2713');
+        cell.value = v;
+        cell.style = { ...xStyle('total', 'text', false), font: { name: 'Calibri', size: 11, bold: true, color: { argb: ok ? 'FF18794E' : 'FFB42318' } } };
+        widths[c0 + i] = Math.max(widths[c0 + i] || 0, String(v).length);
+        continue;
+      }
       if (opts.formulaTotals && typeof v === 'number' && rows.length) {
         const col = colLetter(c0 + i - 1);
         cell.value = { formula: `SUBTOTAL(109,${col}${r0 + 1}:${col}${r - 1})`, result: v };
@@ -1440,6 +1769,28 @@ function writeDataSheet(wb, name, title, records, generated) {
   if (records.length) ws.autoFilter = { from: { row: 4, column: 1 }, to: { row: 4 + records.length, column: n } };
   pageSetup(ws, n > 6, title, '4:4', n);
   return end;
+}
+
+function writeBlockSheet(wb, sheetName, heading, sub, blocks, tabColor) {
+  const ws = wb.addWorksheet(sheetName, { views: [{ showGridLines: false }], properties: { tabColor: { argb: tabColor } } });
+  ws.getColumn(1).width = 3;
+  const maxW = Math.max(4, ...blocks.map((b) => b.headers.length));
+  writeTitle(ws, 1, 2, 1 + maxW, heading, 16);
+  ws.getRow(1).height = 30;
+  writeTitle(ws, 2, 2, 1 + maxW, sub, 10, { italic: true, color: XC.sub });
+  const widths = {};
+  let r = 4;
+  for (const b of blocks) {
+    const w = b.headers.length;
+    writeTitle(ws, r, 2, 1 + w, b.title, 12, { left: state.opts.align === 'smart' });
+    for (let c = 2; c <= 1 + w; c++) ws.getCell(r, c).border = { bottom: { style: 'medium', color: { argb: XC.section } } };
+    ws.getRow(r).height = 22;
+    r = writeTable(ws, r + 1, 2, b.headers, b.types, b.rows, b.total || null, widths);
+    r += 2;
+  }
+  applyWidths(ws, widths, 12, 45);
+  pageSetup(ws, maxW > 6, heading);
+  return ws;
 }
 
 function writeSummarySheet(wb, title, generated) {
@@ -1489,9 +1840,33 @@ async function exportExcel() {
     wb.creator = 'Report Builder';
     wb.created = new Date();
     wb.calcProperties.fullCalcOnLoad = true;
-    const used = new Set(['summary', 'master data']);
+    computeVerification();
+    const used = new Set(['summary', 'master data', 'verification']);
     writeSummarySheet(wb, title, generated);
     writeDataSheet(wb, 'Master Data', title, M.records, generated);
+    if (state.verification) {
+      const V = state.verification;
+      const vws = writeBlockSheet(wb, 'Verification', `${title} — Verification`,
+        `Generated ${generated}  ·  ${V.bad ? V.bad + ' check(s) DID NOT tally — review before use' : 'All checks tally with the raw data'}`,
+        V.blocks, V.bad ? 'FFB42318' : 'FF18794E');
+      vws.getCell(2, 2).style = { font: { name: 'Calibri', size: 11, bold: true, color: { argb: V.bad ? 'FFB42318' : 'FF18794E' } }, alignment: { horizontal: 'center', vertical: 'middle' } };
+    }
+    // Connected lists as their own formatted sheets (optional)
+    for (const conn of state.connections) {
+      if (!conn.exportSheet) continue;
+      const src = state.sources.find((x) => x.id === conn.srcId);
+      if (!src) continue;
+      const ws = wb.addWorksheet(safeSheetName(conn.name + ' (list)', used), { views: [{ state: 'frozen', ySplit: 4, showGridLines: false }] });
+      const n = src.headers.length;
+      writeTitle(ws, 1, 1, n, `${conn.name} — connected list (kept separate from the master)`, 14);
+      ws.getRow(1).height = 26;
+      writeTitle(ws, 2, 1, n, `Source: ${src.fileName} › ${src.sheetName}  ·  ${src.dataRows.length.toLocaleString('en-US')} rows`, 10, { italic: true, color: XC.sub });
+      const widths = {};
+      writeTable(ws, 4, 1, src.headers.map((h) => h.name), src.headers.map(() => 'auto'), src.dataRows, null, widths);
+      applyWidths(ws, widths);
+      if (src.dataRows.length) ws.autoFilter = { from: { row: 4, column: 1 }, to: { row: 4 + src.dataRows.length, column: n } };
+      pageSetup(ws, n > 6, conn.name, '4:4', n);
+    }
 
     const si = M.index[state.opts.splitBy];
     if (si !== undefined) {
@@ -1529,7 +1904,7 @@ function settingsObj() {
   return {
     app: 'report-builder', version: SETTINGS_VERSION,
     title: state.title, fileName: state.fileName, opts: state.opts,
-    template: state.template, colPrefs: state.colPrefs, colOrder: state.colOrder, aliasOverrides: state.aliasOverrides, sheetPrefs: state.sheetPrefs,
+    template: state.template, colPrefs: state.colPrefs, colOrder: state.colOrder, aliasOverrides: state.aliasOverrides, sheetPrefs: state.sheetPrefs, connPrefs: state.connPrefs,
     bdAuto: state.bdAuto, breakdowns: state.breakdowns.map(({ id, ...b }) => b)
   };
 }
@@ -1543,10 +1918,13 @@ function applySettings(s) {
   state.colOrder = s.colOrder || [];
   state.aliasOverrides = s.aliasOverrides || {};
   state.sheetPrefs = s.sheetPrefs || {};
+  state.connPrefs = s.connPrefs || {};
+  state.connections = [];
   for (const src of state.sources) {
     const pref = state.sheetPrefs[sheetKey(src)];
     if (!pref) continue;
     if (pref.include !== undefined) src.include = pref.include;
+    if (pref.role) src.role = pref.role;
     if (pref.headerRow) src.headerIdx = Math.max(0, Math.min(src.grid.length - 1, pref.headerRow - src.r0 - 1));
   }
   state.bdAuto = s.bdAuto !== false;
@@ -1585,8 +1963,10 @@ function wireDrop(id, handler) {
 
 function init() {
   $('#fileInput').addEventListener('change', (e) => { addFiles(e.target.files); e.target.value = ''; });
+  $('#refInput').addEventListener('change', (e) => { addFiles(e.target.files, 'ref'); e.target.value = ''; });
   $('#templateInput').addEventListener('change', (e) => { if (e.target.files[0]) loadTemplate(e.target.files[0]); e.target.value = ''; });
   wireDrop('#dropData', addFiles);
+  wireDrop('#dropRef', (f) => addFiles(f, 'ref'));
   wireDrop('#dropTemplate', (f) => f[0] && loadTemplate(f[0]));
 
   $('#sources').addEventListener('click', (e) => {
@@ -1598,7 +1978,7 @@ function init() {
     const act = t.dataset.act;
     if (act === 'peek') { state.peek = state.peek === src.id ? null : src.id; renderSources(); }
     else if (act === 'del') { state.sources = state.sources.filter((s) => s !== src); refresh('sources'); }
-    else if (act === 'sethdr') { src.headerIdx = +t.dataset.r; state.sheetPrefs[sheetKey(src)] = { include: src.include, headerRow: src.r0 + src.headerIdx + 1 }; refresh('sources'); }
+    else if (act === 'sethdr') { src.headerIdx = +t.dataset.r; state.sheetPrefs[sheetKey(src)] = { include: src.include, headerRow: src.r0 + src.headerIdx + 1, role: src.role }; refresh('sources'); }
   });
   $('#sources').addEventListener('change', (e) => {
     const t = e.target;
@@ -1606,8 +1986,9 @@ function init() {
     const src = state.sources.find((s) => s.id === +(tr && tr.dataset.id));
     if (!src) return;
     if (t.dataset.act === 'inc') src.include = t.checked;
+    if (t.dataset.act === 'role') src.role = t.value;
     if (t.dataset.act === 'hdr') src.headerIdx = Math.max(0, Math.min(src.grid.length - 1, (+t.value || 1) - src.r0 - 1));
-    state.sheetPrefs[sheetKey(src)] = { include: src.include, headerRow: src.r0 + src.headerIdx + 1 };
+    state.sheetPrefs[sheetKey(src)] = { include: src.include, headerRow: src.r0 + src.headerIdx + 1, role: src.role };
     refresh('sources');
   });
 
@@ -1674,18 +2055,30 @@ function init() {
     if (f === 'del') state.breakdowns = state.breakdowns.filter((b) => b !== bd);
     else if (f === 'madd') bd.measures.push({ agg: 'count' });
     else if (f === 'mdel') bd.measures.splice(+t.closest('[data-mi]').dataset.mi, 1);
-    computeSummary();
+    computeSummary(); computeVerification();
     render('summary');
   });
+  $('#connections').addEventListener('change', (e) => {
+    const t = e.target, f = t.dataset.cn;
+    if (!f) return;
+    const conn = state.connections.find((c) => c.key === t.closest('[data-conn]').dataset.conn);
+    if (!conn) return;
+    if (f === 'name') conn.name = t.value.trim() || defaultConnName(state.sources.find((x) => x.id === conn.srcId) || { fileName: 'List' });
+    else if (f === 'addCount' || f === 'exportSheet') conn[f] = t.checked;
+    else conn[f] = t.value;
+    state.connPrefs[conn.key] = { name: conn.name, refKeyNorm: conn.refKeyNorm, masterKey: conn.masterKey, addCount: conn.addCount, exportSheet: conn.exportSheet };
+    refresh('master');
+  });
+
   $('#btnAddBd').addEventListener('click', () => {
     const M = state.master;
     const d = M.defs.find((x) => x.type === 'text' && !x.source) || M.defs[0];
     userBd();
     state.breakdowns.push({ id: nextId++, groupBy: d.key, groupMode: 'value', splitBy: '', measures: [{ agg: 'count' }], pct: true, sort: 'desc' });
-    computeSummary();
+    computeSummary(); computeVerification();
     render('summary');
   });
-  $('#btnResetBd').addEventListener('click', () => { state.bdAuto = true; state.breakdowns = suggestBreakdowns(); computeSummary(); render('summary'); });
+  $('#btnResetBd').addEventListener('click', () => { state.bdAuto = true; state.breakdowns = suggestBreakdowns(); computeSummary(); computeVerification(); render('summary'); });
 
   $('#title').addEventListener('change', (e) => { state.title = e.target.value.trim(); refresh('master'); });
   $('#fileName').addEventListener('change', (e) => { state.fileName = e.target.value.trim(); });
@@ -1715,7 +2108,7 @@ function init() {
   });
   $('#btnReset').addEventListener('click', () => {
     if (state.sources.length && !confirm('Remove all loaded files and settings?')) return;
-    Object.assign(state, { sources: [], template: null, colPrefs: {}, colOrder: [], aliasOverrides: {}, sheetPrefs: {}, columns: [], opts: defaultOpts(), breakdowns: [], bdAuto: true, title: 'Master Report', fileName: '', master: null, summary: null, peek: null });
+    Object.assign(state, { sources: [], template: null, colPrefs: {}, colOrder: [], aliasOverrides: {}, sheetPrefs: {}, connPrefs: {}, connections: [], verification: null, columns: [], opts: defaultOpts(), breakdowns: [], bdAuto: true, title: 'Master Report', fileName: '', master: null, summary: null, peek: null });
     refresh('sources');
   });
   if (typeof XLSX === 'undefined' || typeof ExcelJS === 'undefined') toast('A required library did not load. Please use the built ReportBuilder.html file.', true);

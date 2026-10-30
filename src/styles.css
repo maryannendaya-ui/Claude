@@ -62,7 +62,7 @@ main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 60px; display: grid
 .icon-btn:hover { border-color: var(--line-strong); color: var(--ink); }
 .icon-btn:disabled { opacity: .3; cursor: default; }
 
-.drops { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
+.drops { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 12px; }
 .drop { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; text-align: center; min-height: 120px; padding: 18px; border: 2px dashed var(--line-strong); border-radius: 10px; cursor: pointer; background: var(--row-alt); }
 .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-soft); }
 .drop input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
@@ -135,6 +135,10 @@ table.ui input.name { width: 100%; min-width: 160px; }
 #busy[hidden] { display: none; }
 .spinner { width: 26px; height: 26px; border: 3px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+.ok-text { color: var(--ok); font-weight: 600; }
+.bad-text { color: var(--bad); font-weight: 600; }
+.conn-stats { font-size: 12.5px; margin-top: 8px; }
 
 @media (max-width: 720px) {
   .topbar { padding: 12px 16px; }

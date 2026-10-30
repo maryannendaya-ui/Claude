@@ -2,9 +2,10 @@
 
 A single-file HTML tool that reads multiple Excel/CSV files, combines every sheet
 into one **master sheet**, builds a **summary** (overview, records by source, key
-figures, breakdowns, data checks), and exports a professionally formatted
-**.xlsx** workbook — borders, centered alignment, styled headers, totals,
-frozen panes, auto-filter and print setup included.
+figures, breakdowns, data checks), **verifies** the output against the raw data,
+and exports a professionally formatted **.xlsx** workbook — borders, centered
+alignment, styled headers, totals, frozen panes, auto-filter and print setup
+included.
 
 Runs 100% offline in any modern browser. No install, no internet, no data leaves
 the computer.
@@ -24,10 +25,23 @@ Open **`dist/ReportBuilder.html`** in a browser (double-click it), then:
 3. **Summary** — breakdowns (by category, by month, …) are suggested from the
    data; add or change them freely, including cross-tabs ("spread across columns
    by") and sum/average/count/unique measures.
+3b. **Connected lists** — drop reference data (e.g. an approved vendor list)
+   into the *Connected lists* zone. It is never merged into the master; instead
+   each master row is matched against it (exact value, or a number embedded in
+   the text such as "PRODUCT RELATED SERV (344140)" → group 344140) and gets a
+   match-count column, plus a coverage block in the summary. The full list can
+   optionally be exported as its own formatted sheet.
 4. **Preview & export** — check both tabs, then download the formatted workbook.
    Options include S/N and source columns, skipping total rows, de-duplication,
    sorting, a totals row (live `SUBTOTAL` formulas, so filtering recalculates),
    and one extra sheet per value of a chosen column (e.g. per status or month).
+
+Every report includes a **Verification** tab/sheet: an independent
+reconciliation proving the output tallies with the raw input — every raw row
+accounted for per source (kept + blank + repeated headers + totals + duplicates),
+every numeric column's raw total vs master total, summary breakdown totals
+re-added, extra sheets partitioning the master, and connected-list coverage.
+Each check shows ✓ Tally or ✗ Off by N.
 
 **Save settings** downloads a small JSON file; **Load settings** restores the
 whole configuration next time, so a recurring report is one click.

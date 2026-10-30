@@ -31,6 +31,10 @@
         <input type="file" id="fileInput" multiple accept=".xlsx,.xlsm,.xls,.xlsb,.ods,.csv,.txt">
         <strong>Drop data files here</strong><span>or click to browse</span>
       </label>
+      <label class="drop alt" id="dropRef">
+        <input type="file" id="refInput" multiple accept=".xlsx,.xlsm,.xls,.xlsb,.ods,.csv,.txt">
+        <strong>Connected lists <em>(optional)</em></strong><span>Reference data such as an approved vendor list — matched against the master, kept separate from it</span>
+      </label>
       <label class="drop alt" id="dropTemplate">
         <input type="file" id="templateInput" accept=".xlsx,.xlsm,.xls,.xlsb,.ods,.csv,.txt">
         <strong>Master layout <em>(optional)</em></strong><span>A file with only the column headers you want, in the order you want</span>
@@ -44,6 +48,11 @@
     <div class="card-head"><span class="step">2</span><div><h2>Master sheet columns</h2><p>Columns with the same name across sheets are combined automatically. Rename, reorder, combine, or exclude them here.</p></div></div>
     <div class="opts" id="masterOpts"></div>
     <div id="columns"></div>
+  </section>
+
+  <section class="card" id="stepConn" hidden>
+    <div class="card-head"><span class="step">2b</span><div><h2>Connected lists</h2><p>Each list stays separate. Master rows are matched against it — by exact value or by a number embedded in the text, e.g. “PRODUCT RELATED SERV (344140)” matches group 344140 — and get a match-count column.</p></div></div>
+    <div id="connections"></div>
   </section>
 
   <section class="card" id="step3" hidden>
@@ -64,6 +73,7 @@
     <div class="tabs" role="tablist">
       <button class="tab active" data-tab="summary">Summary</button>
       <button class="tab" data-tab="master">Master sheet</button>
+      <button class="tab" data-tab="verify">Verification</button>
     </div>
     <div id="preview"></div>
     <div class="export-bar">
