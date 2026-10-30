@@ -52,6 +52,23 @@ Each check shows ✓ Tally or ✗ Off by N.
 **Save settings** downloads a small JSON file; **Load settings** restores the
 whole configuration next time, so a recurring report is one click.
 
+## Mask Kit (dist/MaskKit.html)
+
+A companion offline tool for working with confidential data:
+
+1. **Mask** — load the confidential files; every text value becomes a stable
+   token (`VENDOR_0042`), every ID/code becomes a different number with the same
+   shape, consistently across all files, so lookups and connections still work
+   on the masked copies. Amounts, dates, quantities and harmless enums are kept
+   (all per-column choices, with a live preview). Masked files download together
+   with a private key file (optionally passphrase-encrypted, AES-GCM).
+2. Share the masked files for processing — e.g. build the report with the
+   Report Builder, or send them to an AI assistant.
+3. **Unmask** — load the key file plus the processed results; every token and
+   remapped code is restored to the real value wherever it appears (cells,
+   sentences, joined lists), preserving the Excel formatting of the processed
+   file. Computed aggregates pass through untouched.
+
 ## Build from source
 
 ```bash

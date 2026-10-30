@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mask Kit</title>
+<style>/*__CSS__*/</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg viewBox="0 0 24 24" width="30" height="30" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3" fill="currentColor" opacity=".15"/><path d="M7 10a2.2 2.2 0 1 0 0 .01M17 10a2.2 2.2 0 1 0 0 .01M7.5 15.5c1.4 1.2 3 1.8 4.5 1.8s3.1-.6 4.5-1.8" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>
+    <div>
+      <h1>Mask Kit</h1>
+      <p>Mask confidential data before sharing it — then restore the real values in whatever comes back. Works offline; nothing leaves this computer.</p>
+    </div>
+  </div>
+  <div class="top-actions"><button id="btnReset" class="btn ghost">Start over</button></div>
+</header>
+
+<main>
+  <section class="card">
+    <div class="card-head"><span class="step">1</span><div><h2>Mask files</h2><p>Load the confidential files. The same value always gets the same mask, across all files, so lookups and connections still work on the masked data. Codes stay numeric (same number of digits), so group/vendor/material keys remain joinable.</p></div></div>
+    <label class="drop" id="dropMask" style="margin-bottom:12px">
+      <input type="file" id="maskInput" multiple accept=".xlsx,.xlsm,.xls,.csv,.txt">
+      <strong>Drop confidential files here</strong><span>Excel or CSV — every sheet is read</span>
+    </label>
+    <div id="maskCols"></div>
+    <div class="opts" id="maskOpts" hidden>
+      <label title="Rows above the detected header row often hold titles like “Approved Vendor List dated …” — blanking them is the safe default."><input type="checkbox" id="optBlankTop" checked> Blank rows above the header row</label>
+      <label>Key file passphrase <em>(optional)</em> <input type="password" id="passphrase" placeholder="leave empty for plain key file" style="min-width:220px"></label>
+    </div>
+    <div class="row gap" style="margin-top:14px">
+      <button id="btnMask" class="btn primary big" disabled>Mask &amp; download files + key</button>
+      <span id="maskStats" class="muted"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><span class="step">2</span><div><h2>Unmask results</h2><p>Load the key file from step 1, then the processed files that came back. Every mask token and remapped code found in them is replaced with the original value. Excel formatting is preserved.</p></div></div>
+    <div class="drops" style="grid-template-columns:1fr 2fr">
+      <label class="drop alt" id="dropKey">
+        <input type="file" id="keyInput" accept=".json,.maskkey">
+        <strong>Key file</strong><span>…​.maskkey.json from step 1</span>
+        <span class="tpl" id="keyName"></span>
+      </label>
+      <label class="drop" id="dropUnmask">
+        <input type="file" id="unmaskInput" multiple accept=".xlsx,.xlsm,.xls,.csv,.txt">
+        <strong>Processed files to unmask</strong><span>Excel or CSV</span>
+      </label>
+    </div>
+    <div class="row gap" style="margin-top:14px">
+      <label class="field" style="flex-direction:row;align-items:center;gap:8px"><span>Passphrase</span><input type="password" id="passphrase2" placeholder="only if the key file is encrypted"></label>
+      <span id="unmaskStats" class="muted"></span>
+    </div>
+    <div id="unmaskList"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><span class="step">i</span><div><h2>How to use this safely</h2></div></div>
+    <ul style="margin:0;padding-left:20px;line-height:1.8">
+      <li><strong>Keep the key file.</strong> It is the only way back from masked to real values. It never needs to be shared — do not send it along with the masked files.</li>
+      <li><strong>Masked files are safe to share</strong> for processing (e.g. building a report): names become tokens like <code>VENDOR_0042</code>, codes become different numbers with the same shape, and relationships between files are preserved.</li>
+      <li><strong>Check the preview</strong> (sample column on the left) before sharing — set any column that should not leave at all to <em>Blank</em>, and columns that are harmless to <em>Keep</em>.</li>
+      <li><strong>Amounts and dates are kept by default</strong> (reports usually need them). Set them to Blank if they are themselves confidential.</li>
+      <li>Tell whoever processes the data to <strong>keep tokens exactly as they are</strong> (not translate or reformat them) so unmasking can find them.</li>
+      <li>Unmasking replaces tokens and remapped codes wherever they appear — in cells, inside sentences, and in joined lists. A rare clash is possible if a computed number in the report coincides with a remapped code; the unmask report shows how many replacements were made per file so you can sanity-check.</li>
+    </ul>
+  </section>
+</main>
+
+<div id="toast" role="status" aria-live="polite"></div>
+<div id="busy" hidden><div class="spinner"></div><span id="busyText">Working…</span></div>
+
+<script>/*__XLSX__*/</script>
+<script>/*__EXCELJS__*/</script>
+<script>/*__APP__*/</script>
+</body>
+</html>
