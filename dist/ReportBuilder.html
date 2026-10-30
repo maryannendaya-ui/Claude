@@ -319,7 +319,8 @@ MONTH_LOOKUP.sept = 9;
 const TYPE_OPTIONS = [['auto', 'Auto-detect'], ['text', 'Text'], ['int', 'Number (whole)'], ['dec', 'Number (2 decimals)'], ['pct', 'Percent'], ['date', 'Date']];
 const TYPE_NAME = { text: 'Text', int: 'Number', dec: 'Number (0.00)', pct: 'Percent', date: 'Date' };
 const NUMFMT = { text: 'General', int: '#,##0', dec: '#,##0.00', pct: '0.00%', date: 'dd-mmm-yyyy' };
-const AGG_OPTIONS = [['count', 'Count of records'], ['counta', 'Count of'], ['distinct', 'Unique count of'], ['sum', 'Sum of'], ['avg', 'Average of'], ['min', 'Minimum of'], ['max', 'Maximum of']];
+const AGG_OPTIONS = [['count', 'Count of records'], ['counta', 'Count of'], ['distinct', 'Unique count of'], ['list', 'List unique of'], ['sum', 'Sum of'], ['avg', 'Average of'], ['min', 'Minimum of'], ['max', 'Maximum of']];
+const LIST_CAP = 15;
 const NUMERIC = new Set(['int', 'dec', 'pct']);
 
 const TOTAL_RE = /^\s*(grand\s*|sub\s*-?\s*)?totals?\b/i;
@@ -851,37 +852,48 @@ function defaultConnName(src) {
   const m = stem.match(/[A-Za-z]{2,}[A-Za-z&]*/);  // first real word, skipping upload prefixes
   return (m ? m[0].toUpperCase() : stem.slice(0, 20)) || 'List';
 }
+const BRING_CAP = 20;   // distinct values carried into one master cell
 function syncConnections() {
   const prev = new Map(state.connections.map((c) => [c.key, c]));
   state.connections = refSources().map((src) => {
     const key = sheetKey(src);
     const old = prev.get(key) || state.connPrefs[key] || {};
-    const c = {
+    const has = (n) => n && src.headers.some((h) => h.norm === n);
+    const notKey = (h) => !/(number|no\.?$|\bid\b|code)/i.test(h.name);
+    const nameCol = src.headers.find((h) => /\bname\b/i.test(h.name) && notKey(h)) || src.headers.find((h) => /desc/i.test(h.name) && notKey(h));
+    return {
       key, srcId: src.id,
       name: old.name || defaultConnName(src),
-      refKeyNorm: src.headers.some((h) => h.norm === old.refKeyNorm) ? old.refKeyNorm
+      refKeyNorm: has(old.refKeyNorm) ? old.refKeyNorm
         : (src.headers.find((h) => /(number|no\.?$|\bid\b|code)/i.test(h.name)) || src.headers[0] || {}).norm,
       masterKey: old.masterKey || '',
+      refKeyNorm2: has(old.refKeyNorm2) ? old.refKeyNorm2 : '',
+      masterKey2: old.masterKey2 || '',
+      bring: old.bring !== undefined ? (has(old.bring) ? old.bring : '') : (nameCol ? nameCol.norm : ''),
       addCount: old.addCount !== false,
       exportSheet: !!old.exportSheet,
       stats: null
     };
-    return c;
   });
 }
-/** Builds keyNorm -> ref row count for a connection. */
-function connIndex(conn) {
+/** Builds keyNorm -> { count, vals:Set of bring-column values } for one ref key column. */
+function connIndex(conn, keyColNorm) {
   const src = state.sources.find((x) => x.id === conn.srcId);
-  const hi = src ? src.headers.findIndex((h) => h.norm === conn.refKeyNorm) : -1;
+  const hi = src ? src.headers.findIndex((h) => h.norm === keyColNorm) : -1;
   if (!src || hi < 0) return null;
+  const bi = conn.bring ? src.headers.findIndex((h) => h.norm === conn.bring) : -1;
   const idx = new Map();
   for (const row of src.dataRows) {
     const k = keyNorm(row[hi]);
-    if (k) idx.set(k, (idx.get(k) || 0) + 1);
+    if (!k) continue;
+    let e = idx.get(k);
+    if (!e) { e = { count: 0, vals: bi >= 0 ? new Set() : null }; idx.set(k, e); }
+    e.count++;
+    if (bi >= 0 && !isBlank(row[bi])) e.vals.add(String(isDate(row[bi]) ? fmtDate(row[bi]) : row[bi]).trim());
   }
   return idx;
 }
-function autoPickMasterKey(conn, idx, defs, records, index) {
+function autoPickMasterKey(idx, defs, records, index) {
   let best = '', bestHits = 0;
   const sample = records.slice(0, 400);
   for (const d of defs) {
@@ -890,34 +902,52 @@ function autoPickMasterKey(conn, idx, defs, records, index) {
     for (const r of sample) if (matchCandidates(r[index[d.key]]).some((k) => idx.has(k))) hits++;
     if (hits > bestHits) { bestHits = hits; best = d.key; }
   }
-  return bestHits >= Math.max(1, sample.length * 0.1) ? best : '';
+  return bestHits >= Math.max(1, sample.length * 0.02) ? best : '';
 }
-/** Appends one match-count column per active connection; records gain values before __file. */
+function joinVals(set) {
+  if (!set || !set.size) return null;
+  const arr = [...set].sort((a, b) => a.localeCompare(b));
+  return arr.length > BRING_CAP ? arr.slice(0, BRING_CAP).join('; ') + `; (+${arr.length - BRING_CAP} more)` : arr.join('; ');
+}
+/** Appends match-count and brought-value columns per active connection; records gain values before __file. */
 function applyConnections(defs, index, records) {
   syncConnections();
   const fi = defs.findIndex((d) => d.key === '__file');
   let at = fi;
   for (const conn of state.connections) {
-    const idx = connIndex(conn);
+    const idx = connIndex(conn, conn.refKeyNorm);
     if (!idx) { conn.stats = { error: 'key column not found' }; continue; }
+    const refRows = [...idx.values()].reduce((a, b) => a + b.count, 0);
     if (!conn.masterKey || index[conn.masterKey] === undefined || (defs[index[conn.masterKey]] || {}).conn) {
-      conn.masterKey = autoPickMasterKey(conn, idx, defs, records, index);
+      conn.masterKey = autoPickMasterKey(idx, defs, records, index);
     }
     const mi = index[conn.masterKey];
-    if (mi === undefined) { conn.stats = { refRows: [...idx.values()].reduce((a, b) => a + b, 0), keys: idx.size, nomatch: true }; continue; }
-    let matched = 0;
-    const vals = records.map((r) => {
-      let n = 0;
-      for (const k of matchCandidates(r[mi])) { const c = idx.get(k); if (c) { n = c; break; } }
-      if (n) matched++;
-      return n;
-    });
-    conn.stats = { refRows: [...idx.values()].reduce((a, b) => a + b, 0), keys: idx.size, matched, unmatched: records.length - matched };
+    const idx2 = conn.refKeyNorm2 ? connIndex(conn, conn.refKeyNorm2) : null;
+    const mi2 = conn.masterKey2 ? index[conn.masterKey2] : undefined;
+    const rule2 = idx2 && mi2 !== undefined && !(defs[mi2] || {}).conn;
+    if (mi === undefined && !rule2) { conn.stats = { refRows, keys: idx.size, nomatch: true }; continue; }
+    let matched = 0, via1 = 0, via2 = 0;
+    const counts = [], brings = [];
+    for (const r of records) {
+      let hit = null, rule = 0;
+      if (mi !== undefined) for (const k of matchCandidates(r[mi])) { const e = idx.get(k); if (e) { hit = e; rule = 1; break; } }
+      if (!hit && rule2) for (const k of matchCandidates(r[mi2])) { const e = idx2.get(k); if (e) { hit = e; rule = 2; break; } }
+      if (hit) { matched++; if (rule === 1) via1++; else via2++; }
+      counts.push(hit ? hit.count : 0);
+      brings.push(hit ? joinVals(hit.vals) : null);
+    }
+    conn.stats = { refRows, keys: idx.size, matched, unmatched: records.length - matched, via1, via2: rule2 ? via2 : null };
     if (!conn.addCount) continue;
-    const def = { key: 'conn:' + conn.key, name: conn.name + ' Matches', type: 'int', conn: true };
-    defs.splice(at, 0, def);
-    records.forEach((r, i) => r.splice(at, 0, vals[i]));
+    defs.splice(at, 0, { key: 'conn:' + conn.key, name: conn.name + ' Matches', type: 'int', conn: true });
+    records.forEach((r, i) => r.splice(at, 0, counts[i]));
     at++;
+    if (conn.bring) {
+      const src = state.sources.find((x) => x.id === conn.srcId);
+      const bh = src && src.headers.find((h) => h.norm === conn.bring);
+      defs.splice(at, 0, { key: 'connv:' + conn.key, name: conn.name + ' ' + (bh ? bh.name : 'Values'), type: 'text', conn: true, bring: true });
+      records.forEach((r, i) => r.splice(at, 0, brings[i]));
+      at++;
+    }
   }
   Object.keys(index).forEach((k) => delete index[k]);
   defs.forEach((d, i) => { index[d.key] = i; });
@@ -1029,9 +1059,10 @@ function masterView(records) {
 function measureLabel(m, M) {
   if (m.agg === 'count') return 'No. of Records';
   const name = M.defs[M.index[m.col]].name;
-  return { counta: `Count of ${name}`, distinct: `Unique ${name}`, sum: `Total ${name}`, avg: `Average ${name}`, min: `Minimum ${name}`, max: `Maximum ${name}` }[m.agg];
+  return { counta: `Count of ${name}`, distinct: `Unique ${name}`, list: `${name} (distinct list)`, sum: `Total ${name}`, avg: `Average ${name}`, min: `Minimum ${name}`, max: `Maximum ${name}` }[m.agg];
 }
 function measureType(m, M) {
+  if (m.agg === 'list') return 'text';
   if (m.agg === 'count' || m.agg === 'counta' || m.agg === 'distinct') return 'int';
   const t = M.defs[M.index[m.col]].type;
   if (m.agg === 'avg' && t === 'int') return 'dec';
@@ -1045,6 +1076,22 @@ function aggregate(rows, m, M) {
     const s = new Set();
     for (const r of rows) { const v = r[ci]; if (!isBlank(v)) s.add(isDate(v) ? v.getTime() : typeof v === 'string' ? v.trim().toLowerCase() : v); }
     return s.size;
+  }
+  if (m.agg === 'list') {
+    // Values carried over from a connected list are already "a; b; c" — split them
+    // so the result is a true union of distinct items.
+    const seen = new Map();
+    for (const r of rows) {
+      const v = r[ci];
+      if (isBlank(v)) continue;
+      for (const part of String(isDate(v) ? fmtDate(v) : v).split('; ')) {
+        const t = part.trim();
+        if (t && !/^\(\+\d+ more\)$/.test(t)) seen.set(t.toLowerCase(), t);
+      }
+    }
+    const arr = [...seen.values()].sort((a, b) => a.localeCompare(b));
+    if (!arr.length) return null;
+    return arr.length > LIST_CAP ? arr.slice(0, LIST_CAP).join('; ') + ` (+${arr.length - LIST_CAP} more)` : arr.join('; ');
   }
   let sum = 0, n = 0, mn = Infinity, mx = -Infinity, dateCol = false;
   for (const r of rows) {
@@ -1139,20 +1186,32 @@ function breakdownBlock(bd, M) {
     };
   }
 
-  const vals = new Map(groups.map((g) => [g, measures.map((m) => aggregate(g.rows, m, M))]));
-  sortGroups(groups, sort, (g) => { const v = vals.get(g)[0]; return typeof v === 'number' ? v : null; });
-  const totals = measures.map((m) => aggregate(M.records, m, M));
+  let gs = bd.hideBlank ? groups.filter((g) => !g.blank) : groups;
+  const universe = bd.hideBlank ? [].concat(...gs.map((g) => g.rows)) : M.records;
+  const vals = new Map(gs.map((g) => [g, measures.map((m) => aggregate(g.rows, m, M))]));
+  sortGroups(gs, sort, (g) => { const v = vals.get(g)[0]; return typeof v === 'number' ? v : null; });
+  const topN = Math.max(0, +bd.topN || 0);
+  let note = '';
+  if (topN > 0 && gs.length > topN) {
+    const rest = gs.slice(topN);
+    gs = gs.slice(0, topN);
+    const other = { label: `Other (${rest.length.toLocaleString('en-US')} values)`, rows: [].concat(...rest.map((g) => g.rows)) };
+    vals.set(other, measures.map((m) => aggregate(other.rows, m, M)));
+    gs = gs.concat(other);
+    note = ` — Top ${topN}`;
+  }
+  const totals = measures.map((m) => aggregate(universe, m, M));
   const pct = bd.pct !== false && ['count', 'sum', 'counta'].includes(measures[0].agg) && totals[0];
-  const rows = groups.map((g) => {
+  const rows = gs.map((g) => {
     const v = vals.get(g);
     return [g.label, ...v, ...(pct ? [typeof v[0] === 'number' ? v[0] / totals[0] : null] : [])];
   });
   return {
-    title: `By ${gName}`,
+    title: `By ${gName}${note}${bd.hideBlank ? ' (blank ignored)' : ''}`,
     headers: [gName, ...measures.map((m) => measureLabel(m, M)), ...(pct ? ['% of Total'] : [])],
     types: [gType, ...measures.map((m) => measureType(m, M)), ...(pct ? ['pct'] : [])],
     rows,
-    total: ['Total', ...totals, ...(pct ? [1] : [])]
+    total: [bd.hideBlank ? 'Total (excl. blank)' : 'Total', ...totals, ...(pct ? [1] : [])]
   };
 }
 
@@ -1163,6 +1222,21 @@ function suggestBreakdowns() {
   const dataDefs = M.defs.filter((d) => !d.source);
   const nums = dataDefs.filter((d) => (d.type === 'int' || d.type === 'dec') && !d.conn && !ID_RE.test(d.name)).slice(0, 3);
   const measures = [{ agg: 'count' }, ...nums.map((d) => ({ agg: 'sum', col: d.key }))];
+  const out0 = [];
+  // The headline report: which materials/items have the most purchase records,
+  // and (when a connected list brings them in) who their vendors are.
+  const matCol = dataDefs.filter((d) => d.type === 'text' && /(material|item|product|service)/i.test(d.name))
+    .map((d) => ({ d, distinct: new Set(M.records.map((r) => groupKey(r[M.index[d.key]], 'value').k)).size,
+      score: (/desc/i.test(d.name) ? 2 : 0) + (/material/i.test(d.name) ? 1 : 0) }))
+    .filter((x) => x.distinct >= 3)
+    .sort((a, b) => b.score - a.score || b.distinct - a.distinct)[0];
+  if (matCol) {
+    const bringDefs = M.defs.filter((d) => d.bring).slice(0, 2);
+    const moneyDef = nums.find((d) => /value|amount|cost|price|spend/i.test(d.name)) || nums[0];
+    out0.push({ id: nextId++, groupBy: matCol.d.key, groupMode: 'value', splitBy: '',
+      measures: [{ agg: 'count' }, ...(moneyDef ? [{ agg: 'sum', col: moneyDef.key }] : []), ...bringDefs.map((d) => ({ agg: 'list', col: d.key }))],
+      pct: true, sort: 'desc', topN: 15, hideBlank: true });
+  }
   const cands = [];
   for (const d of dataDefs) {
     if (d.type !== 'text' || ID_RE.test(d.name)) continue;
@@ -1173,7 +1247,7 @@ function suggestBreakdowns() {
     cands.push({ d, score: score - distinct / 100 });
   }
   cands.sort((a, b) => b.score - a.score);
-  const out = cands.slice(0, 3).map(({ d }) => ({ id: nextId++, groupBy: d.key, groupMode: 'value', splitBy: '', measures: measures.map((m) => ({ ...m })), pct: true, sort: 'desc' }));
+  const out = out0.concat(cands.slice(0, 3).map(({ d }) => ({ id: nextId++, groupBy: d.key, groupMode: 'value', splitBy: '', measures: measures.map((m) => ({ ...m })), pct: true, sort: 'desc' })));
   const dateDef = dataDefs.find((d) => d.type === 'date');
   if (dateDef) {
     const months = new Set(M.records.map((r) => groupKey(r[M.index[dateDef.key]], 'month').k));
@@ -1183,6 +1257,66 @@ function suggestBreakdowns() {
     out.push({ id: nextId++, groupBy: '__file', groupMode: 'value', splitBy: '', measures: measures.map((m) => ({ ...m })), pct: true, sort: 'alpha' });
   }
   return out;
+}
+
+/** Offline "analyst": deterministic plain-English findings written from the computed data. */
+function analystFindings() {
+  const M = state.master;
+  const out = [];
+  const n = M.records.length;
+  if (!n) return out;
+  const pc = (x) => (x / n * 100).toFixed(1) + '%';
+
+  // 1. Top materials by number of purchase records, with their vendors.
+  const topBd = state.breakdowns.map((bd) => breakdownBlock(bd, M)).find((b) => b && /material|item|product|service/i.test(b.headers[0]));
+  if (topBd && topBd.rows.length) {
+    const listCols = topBd.headers.map((h, i) => (topBd.types[i] === 'text' && i > 0 ? i : -1)).filter((i) => i > 0);
+    topBd.rows.slice(0, 3).forEach((r, i) => {
+      if (String(r[0]).startsWith('Other (')) return;
+      const vendors = listCols.map((c) => r[c]).filter(Boolean).join('; ');
+      out.push(`#${i + 1} ${topBd.headers[0]} by purchase records: "${r[0]}" with ${displayValue(r[1], 'int')} records (${pc(r[1])})` +
+        (vendors ? `. Approved vendors: ${vendors}` : ''));
+    });
+  }
+
+  // 2. Connected-list coverage and gaps.
+  for (const conn of state.connections) {
+    const st = conn.stats;
+    if (!st || st.error || st.nomatch || st.matched === undefined) continue;
+    out.push(`${conn.name}: ${st.matched.toLocaleString('en-US')} of ${n.toLocaleString('en-US')} records (${pc(st.matched)}) have a match in the list` +
+      (st.unmatched ? `; ${st.unmatched.toLocaleString('en-US')} records (${pc(st.unmatched)}) have NO match — review whether these need an approved source.` : '.'));
+    const ci = M.index['connv:' + conn.key];
+    if (ci !== undefined && st.matched) {
+      const freq = new Map();
+      for (const r of M.records) {
+        if (isBlank(r[ci])) continue;
+        for (const part of String(r[ci]).split('; ')) {
+          const t = part.trim();
+          if (t && !/^\(\+\d+ more\)$/.test(t)) freq.set(t, (freq.get(t) || 0) + 1);
+        }
+      }
+      const top = [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+      if (top.length) out.push(`${conn.name}: most frequently available vendors across matched records — ` +
+        top.map(([v, c]) => `${v} (available for ${c.toLocaleString('en-US')} records)`).join('; ') + '.');
+    }
+  }
+
+  // 3. Concentration: biggest value column by group of the first breakdown.
+  const money = M.defs.find((d) => !d.source && !d.conn && d.type === 'dec' && /value|amount|cost|price/i.test(d.name));
+  if (money) {
+    const mi = M.index[money.key];
+    let tot = 0; for (const r of M.records) if (typeof r[mi] === 'number') tot += r[mi];
+    if (tot > 0) {
+      const sorted = M.records.map((r) => (typeof r[mi] === 'number' ? r[mi] : 0)).sort((a, b) => b - a);
+      let acc = 0, k = 0;
+      while (k < sorted.length && acc < tot * 0.8) acc += sorted[k++];
+      out.push(`${money.name}: ${k.toLocaleString('en-US')} records (${pc(k)}) account for 80% of the total ${displayValue(tot, 'dec')}.`);
+    }
+  }
+
+  // 4. Data quality worth knowing.
+  for (const is of M.issues.slice(0, 2)) out.push(`Data quality: ${is.count.toLocaleString('en-US')} value(s) in "${is.col}" are not in the expected format (e.g. ${is.examples.join(', ')}).`);
+  return out.slice(0, 8);
 }
 
 function computeSummary() {
@@ -1203,6 +1337,15 @@ function computeSummary() {
       ['Columns in master sheet', M.defs.filter((d) => !d.source).length]
     ]
   });
+
+  const findings = analystFindings();
+  if (findings.length) {
+    blocks.push({
+      title: 'Analyst Highlights (generated automatically — verify before acting)',
+      headers: ['#', 'Finding'], types: ['int', 'text'],
+      rows: findings.map((f, i) => [i + 1, f])
+    });
+  }
 
   // Records by source
   const counts = new Map();
@@ -1519,21 +1662,29 @@ function renderConnections() {
   if (!state.connections.length || !M) { el.innerHTML = ''; return; }
   el.innerHTML = state.connections.map((conn) => {
     const src = state.sources.find((x) => x.id === conn.srcId);
+    const refOpts = (sel, extra) => extra + (src ? src.headers : []).map((h) => `<option value="${esc(h.norm)}" ${h.norm === sel ? 'selected' : ''}>${esc(h.name)}</option>`).join('');
+    const masterOpts = (sel) => M.defs.filter((d) => !d.source && !d.conn).map((d) => `<option value="${esc(d.key)}" ${d.key === sel ? 'selected' : ''}>${esc(d.name)}</option>`).join('');
     const st = conn.stats || {};
     let stats = '';
     if (st.error) stats = `<span class="bad-text">${esc(st.error)}</span>`;
     else if (st.nomatch) stats = '<span class="warn-text">No master column matches this list — pick one above.</span>';
     else if (st.matched !== undefined) {
       const pc = M.records.length ? (st.matched / M.records.length * 100).toFixed(1) : '0';
-      stats = `<span class="${st.matched ? 'ok-text' : 'bad-text'}">${st.matched.toLocaleString('en-US')} of ${M.records.length.toLocaleString('en-US')} master rows matched (${pc}%)</span> · ${st.refRows.toLocaleString('en-US')} list rows, ${st.keys.toLocaleString('en-US')} unique keys`;
+      const via = st.via2 !== null ? ` (rule 1: ${st.via1.toLocaleString('en-US')}, rule 2: ${st.via2.toLocaleString('en-US')})` : '';
+      stats = `<span class="${st.matched ? 'ok-text' : 'bad-text'}">${st.matched.toLocaleString('en-US')} of ${M.records.length.toLocaleString('en-US')} master rows matched (${pc}%)${via}</span> · ${st.refRows.toLocaleString('en-US')} list rows, ${st.keys.toLocaleString('en-US')} unique keys`;
     }
     return `<div class="bd" data-conn="${esc(conn.key)}">
       <div class="bd-head"><h3>${esc(src ? src.fileName + ' › ' + src.sheetName : conn.key)}</h3></div>
       <div class="bd-grid">
-        <label class="field"><span>Name (used for the Matches column)</span><input type="text" data-cn="name" value="${esc(conn.name)}"></label>
-        <label class="field"><span>Key column in the list</span><select data-cn="refKeyNorm">${(src ? src.headers : []).map((h) => `<option value="${esc(h.norm)}" ${h.norm === conn.refKeyNorm ? 'selected' : ''}>${esc(h.name)}</option>`).join('')}</select></label>
-        <label class="field"><span>Match against master column</span><select data-cn="masterKey"><option value="">(auto)</option>${M.defs.filter((d) => !d.source && !d.conn).map((d) => `<option value="${esc(d.key)}" ${d.key === conn.masterKey ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}</select></label>
-        <label class="field" style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" data-cn="addCount" ${conn.addCount ? 'checked' : ''}> <span>Add “${esc(conn.name)} Matches” column to master</span></label>
+        <label class="field"><span>Name (used for the added columns)</span><input type="text" data-cn="name" value="${esc(conn.name)}"></label>
+        <label class="field"><span>Rule 1 — list key column</span><select data-cn="refKeyNorm">${refOpts(conn.refKeyNorm, '')}</select></label>
+        <label class="field"><span>Rule 1 — master column</span><select data-cn="masterKey"><option value="">(auto)</option>${masterOpts(conn.masterKey)}</select></label>
+        <label class="field"><span>Rule 2 (fallback) — list key column</span><select data-cn="refKeyNorm2">${refOpts(conn.refKeyNorm2, '<option value="">(none)</option>')}</select></label>
+        <label class="field"><span>Rule 2 (fallback) — master column</span><select data-cn="masterKey2"><option value="">(none)</option>${masterOpts(conn.masterKey2)}</select></label>
+        <label class="field"><span>Bring across (distinct values per match)</span><select data-cn="bring"><option value="">(count only)</option>${refOpts(conn.bring, '')}</select></label>
+      </div>
+      <div class="bd-grid" style="margin-top:8px">
+        <label class="field" style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" data-cn="addCount" ${conn.addCount ? 'checked' : ''}> <span>Add “${esc(conn.name)} Matches”${conn.bring ? ' and brought-value' : ''} column(s) to master</span></label>
         <label class="field" style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" data-cn="exportSheet" ${conn.exportSheet ? 'checked' : ''}> <span>Include full list as its own sheet in the export</span></label>
       </div>
       <div class="conn-stats">${stats}</div>
@@ -1566,6 +1717,8 @@ function renderBreakdowns() {
         ${isDateG ? `<label class="field"><span>Dates as</span><select data-bd="groupMode">${[['value', 'Each date'], ['month', 'Month'], ['quarter', 'Quarter'], ['year', 'Year']].map(([v, l]) => `<option value="${v}" ${(bd.groupMode || 'value') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>` : ''}
         <label class="field"><span>Spread across columns by</span><select data-bd="splitBy"><option value="">(none)</option>${defs.filter((d) => d.key !== bd.groupBy).map((d) => opt(d, bd.splitBy)).join('')}</select></label>
         <label class="field"><span>Order</span><select data-bd="sort"><option value="desc" ${bd.sort === 'desc' ? 'selected' : ''}>Largest first</option><option value="alpha" ${bd.sort === 'alpha' ? 'selected' : ''}>A → Z / by date</option></select></label>
+        <label class="field" title="Show only the top N groups; the rest are rolled into an “Other” row. Not applied when spreading across columns."><span>Show top</span><input type="number" min="0" data-bd="topN" value="${+bd.topN || ''}" placeholder="all" style="width:70px"></label>
+        <label class="field" style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" data-bd="hideBlank" ${bd.hideBlank ? 'checked' : ''}> <span>Ignore blank</span></label>
         <label class="field" style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" data-bd="pct" ${bd.pct !== false ? 'checked' : ''}> <span>Show % of total</span></label>
       </div>
       <div class="field" style="margin-top:10px"><span>Values${bd.splitBy ? ' (only the first is used when spreading across columns)' : ''}</span>
@@ -2039,7 +2192,8 @@ function init() {
       const okType = (d) => (['sum', 'avg'].includes(m.agg) ? NUMERIC.has(d.type) : ['min', 'max'].includes(m.agg) ? NUMERIC.has(d.type) || d.type === 'date' : true);
       if (m.agg !== 'count' && (!m.col || !okType(M.defs[M.index[m.col]] || {}))) { const d = M.defs.find(okType); m.col = d ? d.key : ''; }
     } else if (f === 'mcol') bd.measures[mi].col = t.value;
-    else if (f === 'pct') bd.pct = t.checked;
+    else if (f === 'pct' || f === 'hideBlank') bd[f] = t.checked;
+    else if (f === 'topN') bd.topN = +t.value || 0;
     else bd[f] = t.value;
     if (f === 'groupBy') { bd.groupMode = 'value'; if (bd.splitBy === bd.groupBy) bd.splitBy = ''; }
     computeSummary();
@@ -2066,7 +2220,7 @@ function init() {
     if (f === 'name') conn.name = t.value.trim() || defaultConnName(state.sources.find((x) => x.id === conn.srcId) || { fileName: 'List' });
     else if (f === 'addCount' || f === 'exportSheet') conn[f] = t.checked;
     else conn[f] = t.value;
-    state.connPrefs[conn.key] = { name: conn.name, refKeyNorm: conn.refKeyNorm, masterKey: conn.masterKey, addCount: conn.addCount, exportSheet: conn.exportSheet };
+    state.connPrefs[conn.key] = { name: conn.name, refKeyNorm: conn.refKeyNorm, masterKey: conn.masterKey, refKeyNorm2: conn.refKeyNorm2, masterKey2: conn.masterKey2, bring: conn.bring, addCount: conn.addCount, exportSheet: conn.exportSheet };
     refresh('master');
   });
 

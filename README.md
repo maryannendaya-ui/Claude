@@ -25,12 +25,18 @@ Open **`dist/ReportBuilder.html`** in a browser (double-click it), then:
 3. **Summary** — breakdowns (by category, by month, …) are suggested from the
    data; add or change them freely, including cross-tabs ("spread across columns
    by") and sum/average/count/unique measures.
-3b. **Connected lists** — drop reference data (e.g. an approved vendor list)
-   into the *Connected lists* zone. It is never merged into the master; instead
-   each master row is matched against it (exact value, or a number embedded in
-   the text such as "PRODUCT RELATED SERV (344140)" → group 344140) and gets a
-   match-count column, plus a coverage block in the summary. The full list can
-   optionally be exported as its own formatted sheet.
+3b. **Connected lists** — drop reference data (e.g. approved vendor/contractor
+   lists) into the *Connected lists* zone. Lists are never merged into the
+   master. Each master row is matched by up to two rules (each rule = one master
+   column against one list key column; exact value or a number embedded in text,
+   e.g. "PRODUCT RELATED SERV (344140)" → group 344140). A chosen "bring" column
+   (e.g. Vendor Name) carries the distinct matching values into the master, next
+   to the match count. Coverage appears in the summary; the full list can be
+   exported as its own sheet. Breakdowns support a "List unique of" measure,
+   "show top N" (rest rolled into an Other row) and "ignore blank" — the
+   suggested summary leads with Top Materials by purchase records plus their
+   approved vendors, and an auto-written "Analyst Highlights" section states the
+   key findings in plain English.
 4. **Preview & export** — check both tabs, then download the formatted workbook.
    Options include S/N and source columns, skipping total rows, de-duplication,
    sorting, a totals row (live `SUBTOTAL` formulas, so filtering recalculates),
