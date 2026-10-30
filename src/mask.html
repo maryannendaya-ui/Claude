@@ -31,9 +31,10 @@
       <label>Key file passphrase <em>(optional)</em> <input type="password" id="passphrase" placeholder="leave empty for plain key file" style="min-width:220px"></label>
     </div>
     <div class="row gap" style="margin-top:14px">
-      <button id="btnMask" class="btn primary big" disabled>Mask &amp; download files + key</button>
+      <button id="btnMask" class="btn primary big" disabled>Mask the files</button>
       <span id="maskStats" class="muted"></span>
     </div>
+    <div id="maskResults"></div>
   </section>
 
   <section class="card">
@@ -46,7 +47,7 @@
       </label>
       <label class="drop" id="dropUnmask">
         <input type="file" id="unmaskInput" multiple accept=".xlsx,.xlsm,.xls,.csv,.txt">
-        <strong>Processed files to unmask</strong><span>Excel or CSV</span>
+        <strong>Processed files to unmask</strong><span>Excel or CSV — load the key file first</span>
       </label>
     </div>
     <div class="row gap" style="margin-top:14px">

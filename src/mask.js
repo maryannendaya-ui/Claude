@@ -89,8 +89,38 @@ const state = {
   files: [],      // { name, sheets: [{ name, grid, headerIdx }] }
   columns: [],    // { norm, name, mode, count, samples: [] } aggregated by header
   key: null,      // loaded key for unmasking: { nameRev: Map token->orig, codeRev: Map digits->orig }
-  keyRaw: null
+  keyRaw: null,
+  maskResults: [],    // { name, blob, note, key? } ready to save
+  unmaskResults: []
 };
+
+/** Explicit save buttons — browsers often block automatic multi-file downloads,
+ *  so the results of each step are always listed with their own Save button. */
+function renderResults(elId, results, which) {
+  const el = $(elId);
+  if (!results.length) { el.innerHTML = ''; return; }
+  el.innerHTML = `<div class="tbl-wrap" style="margin-top:14px"><table class="ui"><thead><tr><th>Ready to save</th><th></th><th></th></tr></thead><tbody>` +
+    results.map((r, i) => `<tr>
+      <td>${r.key ? '🔑 ' : ''}${esc(r.name)}${r.key ? ' — <strong>keep this private; needed to unmask</strong>' : ''}</td>
+      <td class="muted">${esc(r.note || '')}</td>
+      <td><button class="btn primary sm" data-dl="${which}:${i}">Save file</button></td>
+    </tr>`).join('') +
+    `</tbody></table></div>
+    <div class="row gap" style="margin-top:10px"><button class="btn" data-dl="${which}:all">Save all (${results.length})</button>
+    <span class="muted">If a download does not appear, your browser blocked it — use the individual Save buttons.</span></div>`;
+}
+document.addEventListener('click', async (e) => {
+  const t = e.target.closest('[data-dl]');
+  if (!t) return;
+  const [which, what] = t.dataset.dl.split(':');
+  const results = which === 'm' ? state.maskResults : state.unmaskResults;
+  if (what === 'all') {
+    for (const r of results) { download(r.name, r.blob); await new Promise((res) => setTimeout(res, 500)); }
+  } else {
+    const r = results[+what];
+    if (r) download(r.name, r.blob);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Mask side
@@ -316,12 +346,12 @@ async function doMask() {
       keyBlob = new Blob([JSON.stringify(key, null, 1)], { type: 'application/json' });
     }
     busy(false);
-    for (let i = 0; i < outputs.length; i++) {
-      download(outputs[i].name, outputs[i].blob);
-      await new Promise((r) => setTimeout(r, 400));
-    }
-    download('UNMASK KEY - keep private.maskkey.json', keyBlob);
-    toast(`Masked ${cells.toLocaleString('en-US')} cells: ${maps.names.size.toLocaleString('en-US')} text values tokenized, ${maps.codes.size.toLocaleString('en-US')} codes renumbered. Key file downloaded — keep it private.`);
+    state.maskResults = outputs.map((o) => ({ ...o, note: 'safe to share' }));
+    state.maskResults.push({ name: 'UNMASK KEY - keep private.maskkey.json', blob: keyBlob, key: true, note: pass ? 'encrypted' : 'plain — consider a passphrase' });
+    renderResults('#maskResults', state.maskResults, 'm');
+    $('#maskResults').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    download(state.maskResults[0].name, state.maskResults[0].blob);  // first one is a direct user action, never blocked
+    toast(`Masked ${cells.toLocaleString('en-US')} cells (${maps.names.size.toLocaleString('en-US')} text values, ${maps.codes.size.toLocaleString('en-US')} codes). Save each file below — including the key.`);
   } catch (e) {
     console.error(e);
     busy(false);
@@ -424,7 +454,9 @@ function unmaskCellValue(v, stats) {
 async function unmaskFiles(fileList) {
   const files = [...fileList];
   if (!files.length) return;
+  if (!state.key && !state.keyRaw) { $('#unmaskList').innerHTML = '<div class="empty" style="margin-top:12px">Load the key file (left box) before dropping the processed files.</div>'; toast('Load the key file first.', true); return; }
   if (!(await ensureKey())) return;
+  state.unmaskResults = [];
   busy(true, 'Unmasking…');
   await nextFrame();
   const report = [];
@@ -471,16 +503,19 @@ async function unmaskFiles(fileList) {
         outName = f.name.replace(/\.[^.]+$/, '') + ' - UNMASKED.xlsx';
         blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
       }
-      download(outName, blob);
-      report.push(`${esc(f.name)}: <span class="ok-text">${(stats.names + stats.codes).toLocaleString('en-US')} values restored</span> (${stats.names.toLocaleString('en-US')} names, ${stats.codes.toLocaleString('en-US')} codes)`);
-      await new Promise((r) => setTimeout(r, 400));
+      state.unmaskResults.push({ name: outName, blob, note: `${(stats.names + stats.codes).toLocaleString('en-US')} values restored (${stats.names.toLocaleString('en-US')} names, ${stats.codes.toLocaleString('en-US')} codes)` });
     } catch (e) {
       console.error(e);
       report.push(`${esc(f.name)}: <span class="bad-text">failed — ${esc(e.message || e)}</span>`);
     }
   }
   busy(false);
-  $('#unmaskList').innerHTML = `<ul style="margin:12px 0 0;padding-left:20px;line-height:1.8">${report.map((r) => `<li>${r}</li>`).join('')}</ul>`;
+  renderResults('#unmaskList', state.unmaskResults, 'u');
+  if (report.length) $('#unmaskList').insertAdjacentHTML('beforeend', `<ul style="margin:12px 0 0;padding-left:20px;line-height:1.8">${report.map((r) => `<li>${r}</li>`).join('')}</ul>`);
+  if (state.unmaskResults.length) {
+    $('#unmaskStats').textContent = `${state.unmaskResults.length} file(s) unmasked — save them below.`;
+    download(state.unmaskResults[state.unmaskResults.length - 1].name, state.unmaskResults[state.unmaskResults.length - 1].blob);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -510,7 +545,8 @@ $('#passphrase2').addEventListener('change', () => { if (state.keyRaw && state.k
 $('#btnReset').addEventListener('click', () => {
   if (state.files.length && !confirm('Clear all loaded files and column settings?')) return;
   state.files = []; state.columns = []; state.key = null; state.keyRaw = null;
-  $('#keyName').textContent = ''; $('#unmaskList').innerHTML = '';
+  state.maskResults = []; state.unmaskResults = [];
+  $('#keyName').textContent = ''; $('#unmaskList').innerHTML = ''; $('#maskResults').innerHTML = ''; $('#unmaskStats').textContent = '';
   renderMask();
 });
 
