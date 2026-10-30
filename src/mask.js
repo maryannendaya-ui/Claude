@@ -481,6 +481,78 @@ function unmaskCellValue(v, stats) {
   return v;
 }
 
+async function inPlaceUnmask(buf, stats) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+  wb.worksheets.forEach((ws) => {
+    const nn = unmaskString(ws.name, stats).replace(/[[\]:*?/\\]/g, ' ').slice(0, 31);
+    if (nn && nn !== ws.name) { try { ws.name = nn; } catch (err) { /* duplicate name — keep */ } }
+  });
+  wb.eachSheet((ws) => {
+    ws.eachRow({ includeEmpty: false }, (row) => {
+      row.eachCell({ includeEmpty: false }, (cell) => {
+        const v = cell.value;
+        if (v === null || v === undefined) return;
+        if (typeof v === 'string' || typeof v === 'number') {
+          const nv = unmaskCellValue(v, stats);
+          if (nv !== v) cell.value = nv;
+        } else if (v.richText) {
+          let changed = false;
+          const rt = v.richText.map((p) => {
+            const nt = unmaskString(p.text, stats);
+            if (nt !== p.text) changed = true;
+            return { ...p, text: nt };
+          });
+          if (changed) cell.value = { richText: rt };
+        } else if (v.text !== undefined && v.hyperlink !== undefined) {
+          const nt = unmaskString(v.text, stats);
+          if (nt !== v.text) cell.value = { ...v, text: nt };
+        } else if (v.formula !== undefined && typeof v.result === 'string') {
+          const nr = unmaskString(v.result, stats);
+          if (nr !== v.result) cell.value = { ...v, result: nr };
+        }
+      });
+    });
+  });
+  return wb.xlsx.writeBuffer();
+}
+
+/** Clean rebuild: tolerant read (any producer, .xls included), fresh write.
+ *  Keeps values, sheet names, merges, number formats and column widths. */
+async function rebuildUnmask(buf, stats) {
+  const xwb = XLSX.read(buf, { type: 'array', cellNF: true, cellStyles: true });
+  const wb = new ExcelJS.Workbook();
+  const used = new Set();
+  for (const sn of xwb.SheetNames) {
+    const src = xwb.Sheets[sn];
+    let nn = unmaskString(sn, stats).replace(/[[\]:*?/\\]/g, ' ').trim().slice(0, 31) || 'Sheet';
+    const base = nn;
+    let i = 2;
+    while (used.has(nn.toLowerCase())) { const suf = ` (${i++})`; nn = base.slice(0, 31 - suf.length) + suf; }
+    used.add(nn.toLowerCase());
+    const ws = wb.addWorksheet(nn);
+    if (!src || !src['!ref']) continue;
+    const range = XLSX.utils.decode_range(src['!ref']);
+    for (let R = range.s.r; R <= range.e.r; R++) {
+      for (let C = range.s.c; C <= range.e.c; C++) {
+        const cell = src[XLSX.utils.encode_cell({ r: R, c: C })];
+        if (!cell || cell.v === undefined) continue;
+        const v = cellValue(cell);
+        if (isBlank(v)) continue;
+        const target = ws.getRow(R + 1).getCell(C + 1);
+        target.value = unmaskCellValue(v, stats);
+        if (cell.z && cell.z !== 'General') target.numFmt = cell.z;
+        if (isDate(v) && (!cell.z || cell.z === 'General')) target.numFmt = 'dd-mmm-yyyy';
+      }
+    }
+    for (const m of src['!merges'] || []) {
+      try { ws.mergeCells(m.s.r + 1, m.s.c + 1, m.e.r + 1, m.e.c + 1); } catch (err) { /* overlapping — skip */ }
+    }
+    (src['!cols'] || []).forEach((c, ci) => { if (c && (c.wch || c.width)) ws.getColumn(ci + 1).width = c.wch || c.width; });
+  }
+  return wb.xlsx.writeBuffer();
+}
+
 async function unmaskFiles(fileList) {
   const files = [...fileList];
   if (!files.length) return;
@@ -500,54 +572,16 @@ async function unmaskFiles(fileList) {
         outName = f.name.replace(/\.[^.]+$/, '') + ' - UNMASKED.csv';
         blob = new Blob(['﻿' + text], { type: 'text/csv' });
       } else {
-        // ExcelJS round-trip keeps the formatting of the processed report
-        const wb = new ExcelJS.Workbook();
-        let legacy = false;
         const buf = await f.arrayBuffer();
-        try {
-          await wb.xlsx.load(buf);
-        } catch (err) {
-          // old .xls (or anything ExcelJS cannot open): values-only fallback via SheetJS
-          legacy = true;
-          const xwb = XLSX.read(buf, { type: 'array', cellNF: true });
-          for (const sn of xwb.SheetNames) {
-            const ws = wb.addWorksheet(unmaskString(sn, stats).replace(/[[\]:*?/\\]/g, ' ').slice(0, 31) || 'Sheet');
-            sheetToGrid(xwb.Sheets[sn]).forEach((row, r) => row.forEach((v, c) => {
-              if (!isBlank(v)) ws.getRow(r + 1).getCell(c + 1).value = unmaskCellValue(v, stats);
-            }));
-          }
+        let out = null;
+        // Optional: edit the file in place to keep its styling. Files written by
+        // some tools do not survive this round-trip (Excel then reports a damaged
+        // file), so the reliable clean rebuild below is the default.
+        if ($('#optPreserve').checked) {
+          try { out = await inPlaceUnmask(buf, stats); }
+          catch (err) { console.warn('in-place unmask failed, rebuilding clean:', err); }
         }
-        if (!legacy) wb.worksheets.forEach((ws) => {
-          const nn = unmaskString(ws.name, stats).replace(/[[\]:*?/\\]/g, ' ').slice(0, 31);
-          if (nn && nn !== ws.name) { try { ws.name = nn; } catch (err) { /* duplicate name — keep */ } }
-        });
-        if (!legacy) wb.eachSheet((ws) => {
-          ws.eachRow({ includeEmpty: false }, (row) => {
-            row.eachCell({ includeEmpty: false }, (cell) => {
-              const v = cell.value;
-              if (v === null || v === undefined) return;
-              if (typeof v === 'string' || typeof v === 'number') {
-                const nv = unmaskCellValue(v, stats);
-                if (nv !== v) cell.value = nv;
-              } else if (v.richText) {
-                let changed = false;
-                const rt = v.richText.map((p) => {
-                  const nt = unmaskString(p.text, stats);
-                  if (nt !== p.text) changed = true;
-                  return { ...p, text: nt };
-                });
-                if (changed) cell.value = { richText: rt };
-              } else if (v.text !== undefined && v.hyperlink !== undefined) {
-                const nt = unmaskString(v.text, stats);
-                if (nt !== v.text) cell.value = { ...v, text: nt };
-              } else if (v.formula !== undefined && typeof v.result === 'string') {
-                const nr = unmaskString(v.result, stats);
-                if (nr !== v.result) cell.value = { ...v, result: nr };
-              }
-            });
-          });
-        });
-        const out = await wb.xlsx.writeBuffer();
+        if (!out) out = await rebuildUnmask(buf, stats);
         outName = f.name.replace(/\.[^.]+$/, '') + ' - UNMASKED.xlsx';
         blob = new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
       }
