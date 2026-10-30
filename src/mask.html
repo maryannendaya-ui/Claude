@@ -28,6 +28,8 @@
     <div id="maskCols"></div>
     <div class="opts" id="maskOpts" hidden>
       <label title="Rows above the detected header row often hold titles like “Approved Vendor List dated …” — blanking them is the safe default."><input type="checkbox" id="optBlankTop" checked> Blank rows above the header row</label>
+      <label title="Runs before masking, so all shared data is in one currency. Converts money columns on rows whose currency column says USD, and whole columns whose header names USD (the header is renamed to AED). Conversion is permanent — it is not reversed by unmasking.">
+        <input type="checkbox" id="fxOn" checked> Convert currency first:&nbsp; 1 <input type="text" id="fxFrom" value="USD" style="width:52px"> = <input type="text" id="fxRate" value="3.6725" style="width:80px"> <input type="text" id="fxTo" value="AED" style="width:52px"></label>
       <label>Key file passphrase <em>(optional)</em> <input type="password" id="passphrase" placeholder="leave empty for plain key file" style="min-width:220px"></label>
       <label title="Masking stays consistent within one session. To mask MORE files later so they still match earlier masked files, load the earlier key here first.">Continue from a previous key <input type="file" id="seedKeyInput" accept=".json,.maskkey"> <span class="tpl" id="seedKeyName"></span></label>
     </div>

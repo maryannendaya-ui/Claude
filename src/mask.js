@@ -252,6 +252,60 @@ function maskPreview(c) {
   return isBlank(out) ? '(blank)' : isDate(out) ? fmtDate(out) : String(out).slice(0, 60);
 }
 
+// --- currency conversion (runs on the raw values, before masking) -------------
+const MONEY_NAME_RE = /(value|amount|price|cost|spend|budget|revenue|balance|total)/i;
+/** Converts all from-currency money values in a sheet so the masked output is in
+ *  one currency. Returns the number of converted cells. */
+function convertSheetCurrency(sh, colModes, fx) {
+  const hdr = sh.grid[sh.headerIdx] || [];
+  const from = fx.from.toUpperCase(), to = fx.to.toUpperCase();
+  const nCols = hdr.length;
+  // currency column: data is mostly 3-letter codes and includes the from-currency
+  let curIdx = -1, bestCodes = 0;
+  for (let c = 0; c < nCols; c++) {
+    let codes = 0, hasFrom = 0, tot = 0;
+    for (let r = sh.headerIdx + 1; r < sh.grid.length && tot < 200; r++) {
+      const v = sh.grid[r][c];
+      if (isBlank(v) || typeof v !== 'string') { if (!isBlank(v)) tot++; continue; }
+      tot++;
+      const u = v.trim().toUpperCase();
+      if (/^[A-Z]{3}$/.test(u)) { codes++; if (u === from) hasFrom++; }
+    }
+    if (tot >= 3 && codes / tot >= 0.8 && hasFrom && codes > bestCodes) { bestCodes = codes; curIdx = c; }
+  }
+  // target columns: numeric-majority money columns that are kept, or headers naming the currency
+  const hdrRe = new RegExp('\\b' + from + '\\b');
+  const targets = [];
+  for (let c = 0; c < nCols; c++) {
+    const name = isBlank(hdr[c]) ? '' : String(hdr[c]);
+    if (!name || (colModes[c] && colModes[c] !== 'keep')) continue;
+    let nums = 0, tot = 0;
+    for (let r = sh.headerIdx + 1; r < sh.grid.length && tot < 200; r++) {
+      const v = sh.grid[r][c];
+      if (isBlank(v)) continue;
+      tot++;
+      if (typeof v === 'number') nums++;
+    }
+    if (!tot || nums / tot < 0.6) continue;
+    const inHeader = hdrRe.test(name);
+    if (inHeader || (curIdx >= 0 && MONEY_NAME_RE.test(name))) targets.push({ c, inHeader });
+  }
+  if (!targets.length) return 0;
+  let converted = 0;
+  for (let r = sh.headerIdx + 1; r < sh.grid.length; r++) {
+    const row = sh.grid[r];
+    const rowIsFrom = curIdx >= 0 && String(row[curIdx] ?? '').trim().toUpperCase() === from;
+    let any = false;
+    for (const t of targets) {
+      if (!(t.inHeader || rowIsFrom)) continue;
+      if (typeof row[t.c] === 'number') { row[t.c] = Math.round(row[t.c] * fx.rate * 100) / 100; converted++; any = true; }
+    }
+    if (any && rowIsFrom) row[curIdx] = to;
+  }
+  if (converted) for (const t of targets) if (t.inHeader) hdr[t.c] = String(hdr[t.c]).replace(new RegExp('\\b' + from + '\\b', 'g'), to);
+  return converted;
+}
+
 // --- the mapping machinery ---------------------------------------------------
 function tokenPrefix(colName) {
   const w = String(colName).match(/[A-Za-z]{2,}/);
@@ -323,11 +377,18 @@ async function doMask() {
     const maps = getMaps();   // persists for the session: masking twice gives identical results
     const colByNorm = new Map(state.columns.map((c) => [c.norm, c]));
     const blankTop = $('#optBlankTop').checked;
-    let cells = 0;
+    const fx = $('#fxOn').checked ? { from: ($('#fxFrom').value || 'USD').trim(), to: ($('#fxTo').value || 'AED').trim(), rate: +$('#fxRate').value } : null;
+    const fxOk = fx && fx.rate > 0 && fx.from && fx.to && fx.from.toUpperCase() !== fx.to.toUpperCase();
+    let cells = 0, fxCount = 0;
     const outputs = [];
     for (const f of state.files) {
       const wb = new ExcelJS.Workbook();
       for (const sh of f.sheets) {
+        if (fxOk) {
+          const hdrRow = sh.grid[sh.headerIdx] || [];
+          const modes = hdrRow.map((h) => { const col = isBlank(h) ? null : colByNorm.get(norm(String(h).replace(/\s+/g, ' ').trim())); return col ? col.mode : null; });
+          fxCount += convertSheetCurrency(sh, modes, { ...fx, rate: +fx.rate });
+        }
         const ws = wb.addWorksheet(sh.name.replace(/[[\]:*?/\\]/g, ' ').slice(0, 31) || 'Sheet');
         const hdr = sh.grid[sh.headerIdx] || [];
         const cols = hdr.map((h) => (isBlank(h) ? null : colByNorm.get(norm(String(h).replace(/\s+/g, ' ').trim())) || null));
@@ -355,6 +416,7 @@ async function doMask() {
     // key file
     const key = {
       app: 'maskkit', version: 1, created: new Date().toISOString(),
+      fx: fxOk && fxCount ? { from: fx.from.toUpperCase(), to: fx.to.toUpperCase(), rate: +fx.rate, converted: fxCount } : null,
       columns: state.columns.map((c) => ({ name: c.name, mode: c.mode })),
       names: [...maps.names.values()].map((t) => [t.token, t.original]),
       codes: [...maps.codes.values()].map((m) => [m.masked, m.original])
@@ -373,7 +435,7 @@ async function doMask() {
     renderResults('#maskResults', state.maskResults, 'm');
     $('#maskResults').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     download(state.maskResults[0].name, state.maskResults[0].blob);  // first one is a direct user action, never blocked
-    toast(`Masked ${cells.toLocaleString('en-US')} cells (${maps.names.size.toLocaleString('en-US')} text values, ${maps.codes.size.toLocaleString('en-US')} codes). Save each file below — including the key.`);
+    toast(`Masked ${cells.toLocaleString('en-US')} cells (${maps.names.size.toLocaleString('en-US')} text values, ${maps.codes.size.toLocaleString('en-US')} codes)` + (fxCount ? ` — and converted ${fxCount.toLocaleString('en-US')} ${fx.from.toUpperCase()} values to ${fx.to.toUpperCase()} at ${fx.rate}` : '') + '. Save each file below — including the key.');
   } catch (e) {
     console.error(e);
     busy(false);
