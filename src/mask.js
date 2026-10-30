@@ -543,6 +543,71 @@ function unmaskCellValue(v, stats) {
   return v;
 }
 
+// --- surgical unmask: edit only text inside the xlsx XML parts ----------------
+// The workbook is never re-serialized by a spreadsheet library, so styles,
+// merges, widths, charts and everything else stay byte-identical.
+const XMLESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' };
+const xesc = (t) => String(t).replace(/[&<>"']/g, (c) => XMLESC[c]);
+const xunesc = (t) => String(t).replace(/&(amp|lt|gt|quot|apos|#x?[0-9A-Fa-f]+);/g, (m, e) => {
+  if (e === 'amp') return '&';
+  if (e === 'lt') return '<';
+  if (e === 'gt') return '>';
+  if (e === 'quot') return '"';
+  if (e === 'apos') return "'";
+  return String.fromCodePoint(e[0] === 'x' || e[1] === 'x' ? parseInt(e.slice(e[0] === '#' ? 2 : 1), 16) : parseInt(e.slice(1), 10));
+});
+function unmaskTextNodes(xml, stats) {
+  // every <t> element holds display text (shared strings, rich runs, inline strings, comments)
+  return xml.replace(/(<t(?:\s[^>]*)?>)([\s\S]*?)(<\/t>)/g, (m, open, txt, close) => {
+    const nt = unmaskString(xunesc(txt), stats);
+    return nt === xunesc(txt) ? m : open + xesc(nt) + close;
+  });
+}
+function unmaskWorksheetXml(xml, stats) {
+  // cells: plain numbers may be masked codes; inline/str cells hold text.
+  // shared-string cells (t="s") hold an index — never touched here.
+  xml = xml.replace(/<c\b([^>]*[^/])>([\s\S]*?)<\/c>/g, (m, attrs, inner) => {
+    const t = (attrs.match(/\bt="([^"]*)"/) || [])[1];
+    let out = inner;
+    if (!t || t === 'n') {
+      out = inner.replace(/<v>(-?\d+(?:\.0+)?)<\/v>/, (mv, num) => {
+        const key = String(Math.abs(parseFloat(num))).replace(/^0+(?=\d)/, '');
+        const o = state.key.codeRev.get(key);
+        if (o === undefined) return mv;
+        stats.codes++;
+        return '<v>' + (num.startsWith('-') ? '-' : '') + o + '</v>';
+      });
+    } else if (t === 'inlineStr') {
+      out = unmaskTextNodes(inner, stats);
+    } else if (t === 'str') {
+      out = inner.replace(/<v>([\s\S]*?)<\/v>/, (mv, txt) => '<v>' + xesc(unmaskString(xunesc(txt), stats)) + '</v>');
+    }
+    return out === inner ? m : '<c' + attrs + '>' + out + '</c>';
+  });
+  return xml;
+}
+function surgicalUnmask(buf, stats) {
+  const files = fflate.unzipSync(new Uint8Array(buf));
+  if (!files['xl/workbook.xml'] && !files['xl\\workbook.xml']) throw new Error('not an xlsx package');
+  const dec = new TextDecoder('utf-8');
+  const out = {};
+  for (const [path, data] of Object.entries(files)) {
+    let xml = null;
+    if (path === 'xl/sharedStrings.xml' || /^xl\/(comments|drawings\/|charts\/|tables\/)/.test(path)) {
+      xml = unmaskTextNodes(dec.decode(data), stats);
+    } else if (/^xl\/worksheets\/[^/]+\.xml$/.test(path)) {
+      xml = unmaskWorksheetXml(unmaskTextNodes(dec.decode(data), stats), stats);
+    } else if (path === 'xl/workbook.xml') {
+      xml = dec.decode(data).replace(/(<sheet\b[^>]*?name=")([^"]*)(")/g, (m, a, name, z) => {
+        const nn = unmaskString(xunesc(name), stats).replace(/[[\]:*?/\\]/g, ' ').slice(0, 31);
+        return nn && nn !== xunesc(name) ? a + xesc(nn) + z : m;
+      });
+    }
+    out[path] = xml === null ? data : fflate.strToU8(xml);
+  }
+  return fflate.zipSync(out, { level: 6 });
+}
+
 async function inPlaceUnmask(buf, stats) {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buf);
@@ -636,13 +701,11 @@ async function unmaskFiles(fileList) {
       } else {
         const buf = await f.arrayBuffer();
         let out = null;
-        // Optional: edit the file in place to keep its styling. Files written by
-        // some tools do not survive this round-trip (Excel then reports a damaged
-        // file), so the reliable clean rebuild below is the default.
-        if ($('#optPreserve').checked) {
-          try { out = await inPlaceUnmask(buf, stats); }
-          catch (err) { console.warn('in-place unmask failed, rebuilding clean:', err); }
-        }
+        // Surgical mode: only the text inside the XML parts is edited, so the
+        // file's formatting stays byte-identical. Anything that is not a normal
+        // xlsx package (old .xls, odd producers) falls back to a clean rebuild.
+        try { out = surgicalUnmask(buf, stats); }
+        catch (err) { console.warn('surgical unmask not possible, rebuilding clean:', err); }
         if (!out) out = await rebuildUnmask(buf, stats);
         outName = f.name.replace(/\.[^.]+$/, '') + ' - UNMASKED.xlsx';
         blob = new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });

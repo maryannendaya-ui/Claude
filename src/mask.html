@@ -55,7 +55,6 @@
     </div>
     <div class="row gap" style="margin-top:14px">
       <label class="field" style="flex-direction:row;align-items:center;gap:8px"><span>Passphrase</span><input type="password" id="passphrase2" placeholder="only if the key file is encrypted"></label>
-      <label class="field" style="flex-direction:row;align-items:center;gap:6px" title="Unchecked (recommended): the result is rebuilt as a clean file — values, sheet names, merges, number formats and column widths are kept, colors/borders are not. Checked: the original file is edited in place to keep all styling, which some files do not survive (Excel then reports a damaged file)."><input type="checkbox" id="optPreserve"> <span>Try to keep original colors/styling <em>(can produce a file Excel must repair)</em></span></label>
       <span id="unmaskStats" class="muted"></span>
     </div>
     <div id="unmaskList"></div>
@@ -77,6 +76,7 @@
 <div id="toast" role="status" aria-live="polite"></div>
 <div id="busy" hidden><div class="spinner"></div><span id="busyText">Working…</span></div>
 
+<script>/*__FFLATE__*/</script>
 <script>/*__XLSX__*/</script>
 <script>/*__EXCELJS__*/</script>
 <script>/*__APP__*/</script>
