@@ -290,6 +290,20 @@ function detectHeaderRow(grid) {
   return best;
 }
 
+/** Recognizes reference lists (AVL/ACL and similar) so they are mapped to the
+ *  master instead of being merged into it as rows — wherever they were dropped. */
+function looksLikeRefList(src) {
+  const names = src.fileName + ' | ' + src.sheetName;
+  if (/(^|[^a-z0-9])(avl|acl)([^a-z0-9]|$)/i.test(names)) return true;
+  if (/approved\s+(vendor|contractor|supplier)|vendor\s+list|contractor\s+list|supplier\s+list/i.test(names)) return true;
+  for (const row of src.grid.slice(0, 3)) {
+    for (const v of row) {
+      if (typeof v === 'string' && /approved\s+(vendor|contractor|supplier)\s+list/i.test(v)) return true;
+    }
+  }
+  return false;
+}
+
 async function addFiles(fileList, role) {
   const files = [...fileList];
   if (!files.length) return;
@@ -298,6 +312,7 @@ async function addFiles(fileList, role) {
   let added = 0;
   const errors = [];
   const newSources = [];
+  const autoRef = [];
   for (const f of files) {
     try {
       const wb = await readWorkbook(f);
@@ -313,6 +328,7 @@ async function addFiles(fileList, role) {
           headerIdx: 0, include: g.grid.length > 0 && !hidden, hidden, role: role || 'data'
         };
         src.headerIdx = detectHeaderRow(state.opts.fillMerged ? src.filled : src.grid);
+        if (!role && src.role !== 'ref' && looksLikeRefList(src)) { src.role = 'ref'; autoRef.push(src.fileName + ' › ' + src.sheetName); }
         const pref = state.sheetPrefs[sheetKey(src)];
         if (pref) {
           if (pref.include !== undefined) src.include = pref.include;
@@ -331,6 +347,7 @@ async function addFiles(fileList, role) {
   busy(false);
   markDuplicateCopies(newSources);
   if (errors.length) toast('Could not read ' + errors.join('; '), true);
+  else if (autoRef.length) toast(`Loaded ${added} sheet(s). Recognized as connected list(s), mapped to the master instead of merged into it: ${autoRef.join(', ')}. Change under “Use as” if this is wrong.`);
   else if (added) toast(`Loaded ${added} sheet${added > 1 ? 's' : ''} from ${files.length} file${files.length > 1 ? 's' : ''}`);
   refresh('sources');
 }

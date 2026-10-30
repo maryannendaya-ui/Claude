@@ -180,7 +180,7 @@ table.ui input.name { width: 100%; min-width: 160px; }
       </label>
       <label class="drop alt" id="dropRef">
         <input type="file" id="refInput" multiple accept=".xlsx,.xlsm,.xls,.xlsb,.ods,.csv,.txt">
-        <strong>Connected lists <em>(optional)</em></strong><span>Reference data such as an approved vendor list — matched against the master, kept separate from it</span>
+        <strong>Connected lists <em>(optional)</em></strong><span>Reference data such as an approved vendor list — mapped onto the master rows, never added as rows. AVL/ACL files are recognized automatically even if dropped on the left.</span>
       </label>
       <label class="drop alt" id="dropTemplate">
         <input type="file" id="templateInput" accept=".xlsx,.xlsm,.xls,.xlsb,.ods,.csv,.txt">
@@ -594,6 +594,20 @@ function detectHeaderRow(grid) {
   return best;
 }
 
+/** Recognizes reference lists (AVL/ACL and similar) so they are mapped to the
+ *  master instead of being merged into it as rows — wherever they were dropped. */
+function looksLikeRefList(src) {
+  const names = src.fileName + ' | ' + src.sheetName;
+  if (/(^|[^a-z0-9])(avl|acl)([^a-z0-9]|$)/i.test(names)) return true;
+  if (/approved\s+(vendor|contractor|supplier)|vendor\s+list|contractor\s+list|supplier\s+list/i.test(names)) return true;
+  for (const row of src.grid.slice(0, 3)) {
+    for (const v of row) {
+      if (typeof v === 'string' && /approved\s+(vendor|contractor|supplier)\s+list/i.test(v)) return true;
+    }
+  }
+  return false;
+}
+
 async function addFiles(fileList, role) {
   const files = [...fileList];
   if (!files.length) return;
@@ -602,6 +616,7 @@ async function addFiles(fileList, role) {
   let added = 0;
   const errors = [];
   const newSources = [];
+  const autoRef = [];
   for (const f of files) {
     try {
       const wb = await readWorkbook(f);
@@ -617,6 +632,7 @@ async function addFiles(fileList, role) {
           headerIdx: 0, include: g.grid.length > 0 && !hidden, hidden, role: role || 'data'
         };
         src.headerIdx = detectHeaderRow(state.opts.fillMerged ? src.filled : src.grid);
+        if (!role && src.role !== 'ref' && looksLikeRefList(src)) { src.role = 'ref'; autoRef.push(src.fileName + ' › ' + src.sheetName); }
         const pref = state.sheetPrefs[sheetKey(src)];
         if (pref) {
           if (pref.include !== undefined) src.include = pref.include;
@@ -635,6 +651,7 @@ async function addFiles(fileList, role) {
   busy(false);
   markDuplicateCopies(newSources);
   if (errors.length) toast('Could not read ' + errors.join('; '), true);
+  else if (autoRef.length) toast(`Loaded ${added} sheet(s). Recognized as connected list(s), mapped to the master instead of merged into it: ${autoRef.join(', ')}. Change under “Use as” if this is wrong.`);
   else if (added) toast(`Loaded ${added} sheet${added > 1 ? 's' : ''} from ${files.length} file${files.length > 1 ? 's' : ''}`);
   refresh('sources');
 }
